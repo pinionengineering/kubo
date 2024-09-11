@@ -151,6 +151,35 @@ func badgerSpec() map[string]interface{} {
 	}
 }
 
+func blobSpec(bucket string) map[string]interface{} {
+	return map[string]interface{}{
+		"type": "mount",
+		"mounts": []interface{}{
+			map[string]interface{}{
+				"mountpoint": "/blocks",
+				"type":       "measure",
+				"prefix":     "blob.datastore",
+				"child": map[string]interface{}{
+					"type":      "blob",
+					"path":      "blob",
+					"cacheSize": 100000,
+					"bucket":    bucket,
+				},
+			},
+			map[string]interface{}{
+				"mountpoint": "/",
+				"type":       "measure",
+				"prefix":     "leveldb.datastore",
+				"child": map[string]interface{}{
+					"type":        "levelds",
+					"path":        "datastore",
+					"compression": "none",
+				},
+			},
+		},
+	}
+}
+
 func flatfsSpec() map[string]interface{} {
 	return map[string]interface{}{
 		"type": "mount",

@@ -9,6 +9,7 @@ import (
 	pluginlevelds "github.com/ipfs/kubo/plugin/plugins/levelds"
 	pluginnopfs "github.com/ipfs/kubo/plugin/plugins/nopfs"
 	pluginpeerlog "github.com/ipfs/kubo/plugin/plugins/peerlog"
+	pluginblob "github.com/pinionengineering/pinion-worker/plugins/blob"
 	pluginminion "github.com/pinionengineering/pinion-worker/plugins/minion"
 )
 
@@ -26,4 +27,5 @@ func init() {
 	Preload(pluginfxtest.Plugins...)
 	Preload(pluginnopfs.Plugins...)
 	Preload(pluginminion.Plugins...)
+	Preload(pluginblob.Plugins...)
 }

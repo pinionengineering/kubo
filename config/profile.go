@@ -169,6 +169,27 @@ This profile may only be applied when first initializing the node.`,
 			return nil
 		},
 	},
+	"memblob": {
+		InitOnly: true,
+		Transform: func(c *Config) error {
+			c.Datastore.Spec = blobSpec("mem://")
+			return nil
+		},
+	},
+	"fileblob": {
+		InitOnly: true,
+		Transform: func(c *Config) error {
+			c.Datastore.Spec = blobSpec("file:///tmp/backend")
+			return nil
+		},
+	},
+	"hydrogen": {
+		InitOnly: true,
+		Transform: func(c *Config) error {
+			c.Datastore.Spec = blobSpec("gs://hydrogen-6303-blocks")
+			return nil
+		},
+	},
 	"lowpower": {
 		Description: `Reduces daemon overhead on the system. May affect node
 functionality - performance of content discovery and data
