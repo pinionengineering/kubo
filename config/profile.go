@@ -3,6 +3,8 @@ package config
 import (
 	"fmt"
 	"net"
+	"os"
+	"strconv"
 	"time"
 )
 
@@ -183,10 +185,46 @@ This profile may only be applied when first initializing the node.`,
 			return nil
 		},
 	},
-	"hydrogen": {
+	"pinion": {
 		InitOnly: true,
 		Transform: func(c *Config) error {
-			c.Datastore.Spec = blobSpec("gs://hydrogen-6303-blocks")
+			blocks, found := os.LookupEnv("PINION_STORAGE_BLOCKS")
+			if !found {
+				return fmt.Errorf("PINION_STORAGE_BLOCKS must be set on init")
+			}
+			topic, found := os.LookupEnv("PINION_TOPIC")
+			if !found {
+				return fmt.Errorf("PINION_TOPIC must be set on init")
+			}
+			subscription, found := os.LookupEnv("PINION_SUBSCRIPTION")
+			if !found {
+				return fmt.Errorf("PINION_SUBSCRIPTION must be set on init")
+			}
+			collection, found := os.LookupEnv("PINION_COLLECTION")
+			if !found {
+				return fmt.Errorf("PINION_COLLECTION must be set on init")
+			}
+			maxFailuresStr, found := os.LookupEnv("PINION_MAX_FAILURES")
+			if !found {
+				return fmt.Errorf("PINION_MAX_FAILURES must be set on init")
+			}
+			maxFailures, err := strconv.Atoi(maxFailuresStr)
+			if err != nil {
+				return fmt.Errorf("PINION_MAX_FAILURES must be int. %w", err)
+			}
+
+			c.Datastore.Spec = blobSpec(blocks)
+			c.Plugins.Plugins = map[string]Plugin{
+				"minion": {
+					Disabled: false,
+					Config: map[string]interface{}{
+						"Topic":        topic,
+						"Subscription": subscription,
+						"Collection":   collection,
+						"MaxFailures":  maxFailures,
+					},
+				},
+			}
 			return nil
 		},
 	},

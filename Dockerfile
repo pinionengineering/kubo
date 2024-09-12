@@ -1,13 +1,15 @@
-FROM --platform=${BUILDPLATFORM:-linux/amd64} golang:1.23 AS builder
+FROM --platform=${BUILDPLATFORM:-linux/amd64} docker.io/golang:1.23 AS builder
 
 ARG TARGETOS TARGETARCH
 
 ENV SRC_DIR /kubo
 
+# This is commented out so it works with non-networked docker builds.
+# the vendor/ directory is used instead
 # Download packages first so they can be cached.
-COPY go.mod go.sum $SRC_DIR/
-RUN cd $SRC_DIR \
-  && go mod download
+# COPY go.mod go.sum $SRC_DIR/
+# RUN cd $SRC_DIR \
+#   && go mod download
 
 COPY . $SRC_DIR
 
