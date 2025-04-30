@@ -1,6 +1,6 @@
 module github.com/ipfs/kubo
 
-go 1.24
+go 1.24.0
 
 require (
 	bazil.org/fuse v0.0.0-20200117225306-7b5117fecadc
@@ -261,8 +261,8 @@ require (
 	github.com/petar/GoLLRB v0.0.0-20210522233825-ae3b015fd3e9 // indirect
 	github.com/pinionengineering/datastores v0.0.0-20240911000856-9ae5deda529a // indirect
 	github.com/pinionengineering/go-ds-blob v0.0.0-20240910094632-f3ffb79047f0 // indirect
-	github.com/pinionengineering/pinion-service v0.0.0-20240829212733-a64b1216a65e // indirect
 	github.com/pinionengineering/pinning-service-models v0.0.0-20240325205535-acb598e93506 // indirect
+	github.com/pinionengineering/pinning-service-models-internal v0.0.0-20250429222652-2b91281e59cc // indirect
 	github.com/pion/datachannel v1.5.10 // indirect
 	github.com/pion/dtls/v2 v2.2.12 // indirect
 	github.com/pion/dtls/v3 v3.0.4 // indirect
@@ -349,3 +349,5 @@ require (
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 	lukechampine.com/blake3 v1.4.0 // indirect
 )
+
+replace github.com/pinionengineering/pinion-worker/plugins => ../plugins
