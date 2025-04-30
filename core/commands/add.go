@@ -8,7 +8,6 @@ import (
 	gopath "path"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/ipfs/kubo/config"
 	"github.com/ipfs/kubo/core/commands/cmdenv"
@@ -25,24 +24,7 @@ import (
 )
 
 // ErrDepthLimitExceeded indicates that the max depth has been exceeded.
-var ErrDepthLimitExceeded = fmt.Errorf("depth limit exceeded")
-
-type TimeParts struct {
-	t *time.Time
-}
-
-func (t TimeParts) MarshalJSON() ([]byte, error) {
-	return t.t.MarshalJSON()
-}
-
-// UnmarshalJSON implements the json.Unmarshaler interface.
-// The time is expected to be a quoted string in RFC 3339 format.
-func (t *TimeParts) UnmarshalJSON(data []byte) (err error) {
-	// Fractional seconds are handled implicitly by Parse.
-	tt, err := time.Parse("\"2006-01-02T15:04:05Z\"", string(data))
-	*t = TimeParts{&tt}
-	return
-}
+var ErrDepthLimitExceeded = errors.New("depth limit exceeded")
 
 type AddEvent struct {
 	Name       string
@@ -288,6 +270,10 @@ See 'dag export' and 'dag import' for more information.
 			return fmt.Errorf("%s and %s options are not compatible", onlyHashOptionName, toFilesOptionName)
 		}
 
+		if wrap && toFilesSet {
+			return fmt.Errorf("%s and %s options are not compatible", wrapOptionName, toFilesOptionName)
+		}
+
 		hashFunCode, ok := mh.Names[strings.ToLower(hashFunStr)]
 		if !ok {
 			return fmt.Errorf("unrecognized hash function: %q", strings.ToLower(hashFunStr))
@@ -373,6 +359,11 @@ See 'dag export' and 'dag import' for more information.
 
 				// creating MFS pointers when optional --to-files is set
 				if toFilesSet {
+					if addit.Name() == "" {
+						errCh <- fmt.Errorf("%s: cannot add unnamed files to MFS", toFilesOptionName)
+						return
+					}
+
 					if toFilesStr == "" {
 						toFilesStr = "/"
 					}

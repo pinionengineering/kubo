@@ -138,6 +138,17 @@ func DefaultDatastoreConfig() Datastore {
 	}
 }
 
+func pebbleSpec() map[string]interface{} {
+	return map[string]interface{}{
+		"type":   "measure",
+		"prefix": "pebble.datastore",
+		"child": map[string]interface{}{
+			"type": "pebbleds",
+			"path": "pebbleds",
+		},
+	}
+}
+
 func badgerSpec() map[string]interface{} {
 	return map[string]interface{}{
 		"type":   "measure",
@@ -191,7 +202,7 @@ func flatfsSpec() map[string]interface{} {
 				"child": map[string]interface{}{
 					"type":      "flatfs",
 					"path":      "blocks",
-					"sync":      true,
+					"sync":      false,
 					"shardFunc": "/repo/flatfs/shard/v1/next-to-last/2",
 				},
 			},
