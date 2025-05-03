@@ -248,16 +248,21 @@ NOTE: This profile may only be applied when first initializing node at IPFS_PATH
 			if err != nil {
 				return fmt.Errorf("PINION_MAX_FAILURES must be int. %w", err)
 			}
+			garbage, found := os.LookupEnv("PINION_GARBAGE")
+			if !found {
+				return fmt.Errorf("PINION_GARBAGE must be set on init")
+			}
 
 			c.Datastore.Spec = blobSpec(blocks)
 			c.Plugins.Plugins = map[string]Plugin{
 				"minion": {
 					Disabled: false,
-					Config: map[string]interface{}{
+					Config: map[string]any{
 						"Topic":        topic,
 						"Subscription": subscription,
 						"Collection":   collection,
 						"MaxFailures":  maxFailures,
+						"Garbage":      garbage,
 					},
 				},
 			}
