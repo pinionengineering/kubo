@@ -262,7 +262,7 @@ require (
 	github.com/pinionengineering/datastores v0.0.0-20240911000856-9ae5deda529a // indirect
 	github.com/pinionengineering/go-ds-blob v0.0.0-20240910094632-f3ffb79047f0 // indirect
 	github.com/pinionengineering/pinning-service-models v0.0.0-20240325205535-acb598e93506 // indirect
-	github.com/pinionengineering/pinning-service-models-internal v0.0.0-20250511044539-1e4a4f728d97 // indirect
+	github.com/pinionengineering/pinning-service-models-internal v0.0.0-20250513180049-ef9af3de2025 // indirect
 	github.com/pion/datachannel v1.5.10 // indirect
 	github.com/pion/dtls/v2 v2.2.12 // indirect
 	github.com/pion/dtls/v3 v3.0.4 // indirect
