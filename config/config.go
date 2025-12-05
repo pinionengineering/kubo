@@ -31,17 +31,23 @@ type Config struct {
 	Pubsub    PubsubConfig
 	Peering   Peering
 	DNS       DNS
-	Migration Migration
 
-	Provider     Provider
-	Reprovider   Reprovider
-	Experimental Experiments
-	Plugins      Plugins
-	Pinning      Pinning
-	Import       Import
-	Version      Version
+	Migration Migration
+	AutoConf  AutoConf
+
+	Provide       Provide    // Merged Provider and Reprovider configuration
+	Provider      Provider   // Deprecated: use Provide. Will be removed in a future release.
+	Reprovider    Reprovider // Deprecated: use Provide. Will be removed in a future release.
+	HTTPRetrieval HTTPRetrieval
+	Experimental  Experiments
+	Plugins       Plugins
+	Pinning       Pinning
+	Import        Import
+	Version       Version
 
 	Internal Internal // experimental/unstable options
+
+	Bitswap Bitswap `json:",omitempty"`
 }
 
 const (

@@ -8,12 +8,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/dustin/go-humanize"
 	blockstore "github.com/ipfs/boxo/blockstore"
 	offline "github.com/ipfs/boxo/exchange/offline"
 	uio "github.com/ipfs/boxo/ipld/unixfs/io"
 	util "github.com/ipfs/boxo/util"
-	"github.com/ipfs/go-log"
+	"github.com/ipfs/go-log/v2"
 	"github.com/ipfs/kubo/config"
 	"github.com/ipfs/kubo/core/node/libp2p"
 	"github.com/ipfs/kubo/p2p"
@@ -49,7 +48,9 @@ func LibP2P(bcfg *BuildCfg, cfg *config.Config, userResourceOverrides rcmgr.Part
 		grace := cfg.Swarm.ConnMgr.GracePeriod.WithDefault(config.DefaultConnMgrGracePeriod)
 		low := int(cfg.Swarm.ConnMgr.LowWater.WithDefault(config.DefaultConnMgrLowWater))
 		high := int(cfg.Swarm.ConnMgr.HighWater.WithDefault(config.DefaultConnMgrHighWater))
-		connmgr = fx.Provide(libp2p.ConnectionManager(low, high, grace))
+		silence := cfg.Swarm.ConnMgr.SilencePeriod.WithDefault(config.DefaultConnMgrSilencePeriod)
+		connmgr = fx.Provide(libp2p.ConnectionManager(low, high, grace, silence))
+
 	default:
 		return fx.Error(fmt.Errorf("unrecognized Swarm.ConnMgr.Type: %q", connMgrType))
 	}
@@ -214,6 +215,7 @@ func LibP2P(bcfg *BuildCfg, cfg *config.Config, userResourceOverrides rcmgr.Part
 
 		fx.Provide(libp2p.Routing),
 		fx.Provide(libp2p.ContentRouting),
+		fx.Provide(libp2p.ContentDiscovery),
 
 		fx.Provide(libp2p.BaseRouting(cfg)),
 		maybeProvide(libp2p.PubsubRouter, bcfg.getOpt("ipnsps")),
@@ -247,7 +249,12 @@ func Storage(bcfg *BuildCfg, cfg *config.Config) fx.Option {
 	return fx.Options(
 		fx.Provide(RepoConfig),
 		fx.Provide(Datastore),
-		fx.Provide(BaseBlockstoreCtor(cacheOpts, cfg.Datastore.HashOnRead, cfg.Datastore.WriteThrough.WithDefault(config.DefaultWriteThrough))),
+		fx.Provide(BaseBlockstoreCtor(
+			cacheOpts,
+			cfg.Datastore.HashOnRead,
+			cfg.Datastore.WriteThrough.WithDefault(config.DefaultWriteThrough),
+			cfg.Provide.Strategy.WithDefault(config.DefaultProvideStrategy),
+		)),
 		finalBstore,
 	)
 }
@@ -335,15 +342,18 @@ func Online(bcfg *BuildCfg, cfg *config.Config, userResourceOverrides rcmgr.Part
 		recordLifetime = d
 	}
 
-	/* don't provide from bitswap when the strategic provider service is active */
-	shouldBitswapProvide := !cfg.Experimental.StrategicProviding
+	isBitswapLibp2pEnabled := cfg.Bitswap.Libp2pEnabled.WithDefault(config.DefaultBitswapLibp2pEnabled)
+	isBitswapServerEnabled := cfg.Bitswap.ServerEnabled.WithDefault(config.DefaultBitswapServerEnabled)
+	isHTTPRetrievalEnabled := cfg.HTTPRetrieval.Enabled.WithDefault(config.DefaultHTTPRetrievalEnabled)
+
+	// The Provide system handles both new CID announcements and periodic re-announcements.
+	// Disabling is controlled by Provide.Enabled=false or setting Interval to 0.
+	isProviderEnabled := cfg.Provide.Enabled.WithDefault(config.DefaultProvideEnabled) && cfg.Provide.DHT.Interval.WithDefault(config.DefaultProvideDHTInterval) != 0
 
 	return fx.Options(
 		fx.Provide(BitswapOptions(cfg)),
-		fx.Provide(Bitswap(shouldBitswapProvide)),
-		fx.Provide(OnlineExchange()),
-		// Replace our Exchange with a Providing exchange!
-		fx.Decorate(ProvidingExchange(shouldBitswapProvide)),
+		fx.Provide(Bitswap(isBitswapServerEnabled, isBitswapLibp2pEnabled, isHTTPRetrievalEnabled)),
+		fx.Provide(OnlineExchange(isBitswapLibp2pEnabled)),
 		fx.Provide(DNSResolver),
 		fx.Provide(Namesys(ipnsCacheSize, cfg.Ipns.MaxCacheTTL.WithDefault(config.DefaultIpnsMaxCacheTTL))),
 		fx.Provide(Peering),
@@ -354,12 +364,7 @@ func Online(bcfg *BuildCfg, cfg *config.Config, userResourceOverrides rcmgr.Part
 		fx.Provide(p2p.New),
 
 		LibP2P(bcfg, cfg, userResourceOverrides),
-		OnlineProviders(
-			cfg.Experimental.StrategicProviding,
-			cfg.Reprovider.Strategy.WithDefault(config.DefaultReproviderStrategy),
-			cfg.Reprovider.Interval.WithDefault(config.DefaultReproviderInterval),
-			cfg.Routing.AcceleratedDHTClient.WithDefault(config.DefaultAcceleratedDHTClient),
-		),
+		OnlineProviders(isProviderEnabled, cfg),
 	)
 }
 
@@ -372,6 +377,7 @@ func Offline(cfg *config.Config) fx.Option {
 		fx.Provide(libp2p.Routing),
 		fx.Provide(libp2p.ContentRouting),
 		fx.Provide(libp2p.OfflineRouting),
+		fx.Provide(libp2p.ContentDiscovery),
 		OfflineProviders(),
 	)
 }
@@ -381,8 +387,6 @@ var Core = fx.Options(
 	fx.Provide(Dag),
 	fx.Provide(FetcherConfig),
 	fx.Provide(PathResolverConfig),
-	fx.Provide(Pinning),
-	fx.Provide(Files),
 )
 
 func Networked(bcfg *BuildCfg, cfg *config.Config, userResourceOverrides rcmgr.PartialLimitConfig) fx.Option {
@@ -408,31 +412,51 @@ func IPFS(ctx context.Context, bcfg *BuildCfg) fx.Option {
 		return fx.Error(err)
 	}
 
-	// Auto-sharding settings
-	shardSizeString := cfg.Internal.UnixFSShardingSizeThreshold.WithDefault("256kiB")
-	shardSizeInt, err := humanize.ParseBytes(shardSizeString)
-	if err != nil {
-		return fx.Error(err)
-	}
-	uio.HAMTShardingSize = int(shardSizeInt)
-
 	// Migrate users of deprecated Experimental.ShardingEnabled flag
 	if cfg.Experimental.ShardingEnabled {
-		logger.Fatal("The `Experimental.ShardingEnabled` field is no longer used, please remove it from the config.\n" +
-			"go-ipfs now automatically shards when directory block is bigger than  `" + shardSizeString + "`.\n" +
-			"If you need to restore the old behavior (sharding everything) set `Internal.UnixFSShardingSizeThreshold` to `1B`.\n")
+		logger.Fatal("The `Experimental.ShardingEnabled` field is no longer used, please remove it from the config. Use Import.UnixFSHAMTDirectorySizeThreshold instead.")
 	}
+	if !cfg.Internal.UnixFSShardingSizeThreshold.IsDefault() {
+		msg := "The `Internal.UnixFSShardingSizeThreshold` field was renamed to `Import.UnixFSHAMTDirectorySizeThreshold`. Please update your config.\n"
+		if !cfg.Import.UnixFSHAMTDirectorySizeThreshold.IsDefault() {
+			logger.Fatal(msg) // conflicting values, hard fail
+		}
+		logger.Error(msg)
+		// Migrate the old OptionalString value to the new OptionalBytes field.
+		// Since OptionalBytes embeds OptionalString, we can construct it directly
+		// with the old value, preserving the user's original string (e.g., "256KiB").
+		cfg.Import.UnixFSHAMTDirectorySizeThreshold = config.OptionalBytes{OptionalString: *cfg.Internal.UnixFSShardingSizeThreshold}
+	}
+
+	// Validate Import configuration
+	if err := config.ValidateImportConfig(&cfg.Import); err != nil {
+		return fx.Error(err)
+	}
+
+	// Validate Provide configuration
+	if err := config.ValidateProvideConfig(&cfg.Provide); err != nil {
+		return fx.Error(err)
+	}
+
+	// Auto-sharding settings
+	shardSingThresholdInt := cfg.Import.UnixFSHAMTDirectorySizeThreshold.WithDefault(config.DefaultUnixFSHAMTDirectorySizeThreshold)
+	shardMaxFanout := cfg.Import.UnixFSHAMTDirectoryMaxFanout.WithDefault(config.DefaultUnixFSHAMTDirectoryMaxFanout)
+	// TODO: avoid overriding this globally, see if we can extend Directory interface like Get/SetMaxLinks from https://github.com/ipfs/boxo/pull/906
+	uio.HAMTShardingSize = int(shardSingThresholdInt)
+	uio.DefaultShardWidth = int(shardMaxFanout)
+
+	providerStrategy := cfg.Provide.Strategy.WithDefault(config.DefaultProvideStrategy)
 
 	return fx.Options(
 		bcfgOpts,
-
-		fx.Provide(baseProcess),
 
 		Storage(bcfg, cfg),
 		Identity(cfg),
 		IPNS,
 		Networked(bcfg, cfg, userResourceOverrides),
 		fx.Provide(BlockService(cfg)),
+		fx.Provide(Pinning(providerStrategy)),
+		fx.Provide(Files(providerStrategy)),
 		Core,
 	)
 }

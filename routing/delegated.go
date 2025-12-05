@@ -6,11 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"path"
+	"strings"
 
 	drclient "github.com/ipfs/boxo/routing/http/client"
 	"github.com/ipfs/boxo/routing/http/contentrouter"
 	"github.com/ipfs/go-datastore"
-	logging "github.com/ipfs/go-log"
+	logging "github.com/ipfs/go-log/v2"
 	version "github.com/ipfs/kubo"
 	"github.com/ipfs/kubo/config"
 	dht "github.com/libp2p/go-libp2p-kad-dht"
@@ -24,6 +26,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/routing"
 	ma "github.com/multiformats/go-multiaddr"
 	"go.opencensus.io/stats/view"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
 
 var log = logging.Logger("routing/delegated")
@@ -149,12 +152,13 @@ func parse(visited map[string]bool,
 }
 
 type ExtraHTTPParams struct {
-	PeerID     string
-	Addrs      []string
-	PrivKeyB64 string
+	PeerID        string
+	Addrs         []string
+	PrivKeyB64    string
+	HTTPRetrieval bool
 }
 
-func ConstructHTTPRouter(endpoint string, peerID string, addrs []string, privKey string) (routing.Routing, error) {
+func ConstructHTTPRouter(endpoint string, peerID string, addrs []string, privKey string, httpRetrieval bool) (routing.Routing, error) {
 	return httpRoutingFromConfig(
 		config.Router{
 			Type: "http",
@@ -163,9 +167,10 @@ func ConstructHTTPRouter(endpoint string, peerID string, addrs []string, privKey
 			},
 		},
 		&ExtraHTTPParams{
-			PeerID:     peerID,
-			Addrs:      addrs,
-			PrivKeyB64: privKey,
+			PeerID:        peerID,
+			Addrs:         addrs,
+			PrivKeyB64:    privKey,
+			HTTPRetrieval: httpRetrieval,
 		},
 	)
 }
@@ -185,8 +190,27 @@ func httpRoutingFromConfig(conf config.Router, extraHTTP *ExtraHTTPParams) (rout
 
 	delegateHTTPClient := &http.Client{
 		Transport: &drclient.ResponseBodyLimitedTransport{
-			RoundTripper: transport,
-			LimitBytes:   1 << 20,
+			RoundTripper: otelhttp.NewTransport(transport,
+				otelhttp.WithSpanNameFormatter(func(operation string, req *http.Request) string {
+					if req.Method == http.MethodGet {
+						switch {
+						case strings.HasPrefix(req.URL.Path, "/routing/v1/providers"):
+							return "DelegatedHTTPClient.FindProviders"
+						case strings.HasPrefix(req.URL.Path, "/routing/v1/peers"):
+							return "DelegatedHTTPClient.FindPeers"
+						case strings.HasPrefix(req.URL.Path, "/routing/v1/ipns"):
+							return "DelegatedHTTPClient.GetIPNS"
+						}
+					} else if req.Method == http.MethodPut {
+						switch {
+						case strings.HasPrefix(req.URL.Path, "/routing/v1/ipns"):
+							return "DelegatedHTTPClient.PutIPNS"
+						}
+					}
+					return "DelegatedHTTPClient." + path.Dir(req.URL.Path)
+				}),
+			),
+			LimitBytes: 1 << 20,
 		},
 	}
 
@@ -200,13 +224,18 @@ func httpRoutingFromConfig(conf config.Router, extraHTTP *ExtraHTTPParams) (rout
 		return nil, err
 	}
 
+	protocols := config.DefaultHTTPRoutersFilterProtocols
+	if extraHTTP.HTTPRetrieval {
+		protocols = append(protocols, "transport-ipfs-gateway-http")
+	}
+
 	cli, err := drclient.New(
 		params.Endpoint,
 		drclient.WithHTTPClient(delegateHTTPClient),
 		drclient.WithIdentity(key),
 		drclient.WithProviderInfo(addrInfo.ID, addrInfo.Addrs),
 		drclient.WithUserAgent(version.GetUserAgentVersion()),
-		drclient.WithProtocolFilter(config.DefaultHTTPRoutersFilterProtocols),
+		drclient.WithProtocolFilter(protocols),
 		drclient.WithStreamResultsRequired(),       // https://specs.ipfs.tech/routing/http-routing-v1/#streaming
 		drclient.WithDisabledLocalFiltering(false), // force local filtering in case remote server does not support IPIP-484
 	)

@@ -18,7 +18,7 @@ import (
 	pinclient "github.com/ipfs/boxo/pinning/remote/client"
 	cid "github.com/ipfs/go-cid"
 	cmds "github.com/ipfs/go-ipfs-cmds"
-	logging "github.com/ipfs/go-log"
+	logging "github.com/ipfs/go-log/v2"
 	config "github.com/ipfs/kubo/config"
 	"github.com/ipfs/kubo/core/commands/cmdenv"
 	"github.com/ipfs/kubo/core/commands/cmdutils"
@@ -171,6 +171,10 @@ NOTE: a comma-separated notation is supported in CLI for convenience:
 		opts := []pinclient.AddOption{}
 		if name, nameFound := req.Options[pinNameOptionName]; nameFound {
 			nameStr := name.(string)
+			// Validate pin name
+			if err := cmdutils.ValidatePinName(nameStr); err != nil {
+				return err
+			}
 			opts = append(opts, pinclient.PinOpts.WithName(nameStr))
 		}
 
@@ -321,6 +325,11 @@ func lsRemote(ctx context.Context, req *cmds.Request, c *pinclient.Client, out c
 	opts := []pinclient.LsOption{}
 	if name, nameFound := req.Options[pinNameOptionName]; nameFound {
 		nameStr := name.(string)
+		// Validate name filter
+		if err := cmdutils.ValidatePinName(nameStr); err != nil {
+			close(out)
+			return err
+		}
 		opts = append(opts, pinclient.PinOpts.FilterName(nameStr))
 	}
 
