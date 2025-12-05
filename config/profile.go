@@ -298,7 +298,10 @@ NOTE: This profile may only be applied when first initializing node at IPFS_PATH
 						"Garbage":      garbage,
 					},
 				},
-			},
+			}
+			return nil
+		},
+	},
 	"badgerds-measure": {
 		Description: `Configures the node to use the legacy badgerv1 datastore with metrics wrapper.
 Additional '*_datastore_*' metrics will be exposed on /debug/metrics/prometheus

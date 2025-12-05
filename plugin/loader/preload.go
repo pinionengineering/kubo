@@ -29,7 +29,7 @@ func init() {
 	Preload(pluginpeerlog.Plugins...)
 	Preload(pluginfxtest.Plugins...)
 	Preload(pluginnopfs.Plugins...)
+	Preload(plugintelemetry.Plugins...)
 	Preload(pluginminion.Plugins...)
 	Preload(pluginblob.Plugins...)
-	Preload(plugintelemetry.Plugins...)
 }
