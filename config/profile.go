@@ -287,6 +287,10 @@ NOTE: This profile may only be applied when first initializing node at IPFS_PATH
 			}
 
 			c.Datastore.Spec = blobSpec(blocks)
+			// Disable bloom filter to prevent stale cache after GC
+			// Multiple writers share the same backend storage, so a bloom filter
+			// would become stale when blocks are deleted and re-added
+			c.Datastore.BloomFilterSize = 0
 			c.Plugins.Plugins = map[string]Plugin{
 				"minion": {
 					Disabled: false,
