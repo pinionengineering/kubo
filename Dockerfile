@@ -1,6 +1,12 @@
 FROM --platform=${BUILDPLATFORM:-linux/amd64} docker.io/golang:1.25 AS builder
 
 ARG TARGETOS TARGETARCH
+# Go auto-disables cgo when cross-compiling, which is all this has ever done
+# on x86 build hosts. Pinned explicitly so a future arm64-native build host
+# (matching GOARCH, no longer a cross-compile) can't silently flip cgo back
+# on and dynamically link against a glibc version that may not match the one
+# bundled in the busybox:stable-glibc runtime stage below.
+ARG CGO_ENABLED=0
 
 ENV SRC_DIR=/kubo
 
@@ -26,7 +32,7 @@ ARG MAKE_TARGET=build
 RUN --mount=type=cache,target=/go/pkg/mod \
   --mount=type=cache,target=/root/.cache/go-build \
   mkdir -p .git/objects \
-  && GOOS=$TARGETOS GOARCH=$TARGETARCH GOFLAGS=-buildvcs=false make ${MAKE_TARGET} IPFS_PLUGINS=$IPFS_PLUGINS
+  && CGO_ENABLED=$CGO_ENABLED GOOS=$TARGETOS GOARCH=$TARGETARCH GOFLAGS=-buildvcs=false make ${MAKE_TARGET} IPFS_PLUGINS=$IPFS_PLUGINS
 
 # Extract required runtime tools from Debian.
 # We use Debian instead of Alpine because we need glibc compatibility
