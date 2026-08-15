@@ -817,6 +817,12 @@ github.com/pinionengineering/go-ds-blob v0.0.0-20240910094632-f3ffb79047f0 h1:5x
 github.com/pinionengineering/go-ds-blob v0.0.0-20240910094632-f3ffb79047f0/go.mod h1:aCN3m8iMdUzHNLCYMzmiWFTfccfRxdV6qyW9pX93AxA=
 github.com/pinionengineering/pinning-service-models v0.0.0-20260610232406-87c128cc1789 h1:W0DgECalyX6Wpr9PlMeWzY41W1ldvmHdSQ8IHF550M4=
 github.com/pinionengineering/pinning-service-models v0.0.0-20260610232406-87c128cc1789/go.mod h1:n+GH1hULUXswpQuRgnSwmI4tZe7bsZk8cuYOtxLArTY=
+github.com/pinionengineering/pinning-service-models-internal v0.0.0-20250805070521-56fc234dabde h1:NFFrDaJI+548kFm1J5iEJ+ivTn3z3pD0A+TXtMt/z3w=
+github.com/pinionengineering/pinning-service-models-internal v0.0.0-20250805070521-56fc234dabde/go.mod h1:VouY7+Msu8aV2crhhPIsfSy5xcpks69ixstFPuGSUek=
+github.com/pinionengineering/pinning-service-models-internal v0.0.0-20260815055231-8bc63ca0254f h1:kO99edEfY2Fy57ZkcAmd0vnCjf7CuuI0+QFgsbtcFkU=
+github.com/pinionengineering/pinning-service-models-internal v0.0.0-20260815055231-8bc63ca0254f/go.mod h1:C293LZwF6gWrEbgeWYXgVKg+p5gs4Qk/KB03xnKn/78=
+github.com/pinionengineering/reconciler v0.0.0-20260815054841-de83e7946a47 h1:+20uhCIhoTEO+QQR2wLqbE7LbC2lygtLhFwrtdU5HO8=
+github.com/pinionengineering/reconciler v0.0.0-20260815054841-de83e7946a47/go.mod h1:OVtSyMBITGsBfOV2alKRBAJY5FU7nogYGtUQWa1j8uQ=
 github.com/pion/datachannel v1.5.10 h1:ly0Q26K1i6ZkGf42W7D4hQYR90pZwzFOjTq5AuCKk4o=
 github.com/pion/datachannel v1.5.10/go.mod h1:p/jJfC9arb29W7WrxyKbepTU20CFgyx5oLo8Rs4Py/M=
 github.com/pion/dtls/v3 v3.1.5 h1:9xJtVsHwMYeSjPp5Hh1FTis4DchnQWtnOa5o+6ygqfc=
