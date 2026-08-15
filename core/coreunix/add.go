@@ -26,6 +26,7 @@ import (
 	"github.com/ipfs/go-cid"
 	ipld "github.com/ipfs/go-ipld-format"
 	logging "github.com/ipfs/go-log/v2"
+	"github.com/ipfs/kubo/config"
 	coreiface "github.com/ipfs/kubo/core/coreiface"
 
 	"github.com/ipfs/kubo/tracing"
@@ -52,49 +53,52 @@ func NewAdder(ctx context.Context, p pin.Pinner, bs bstore.GCLocker, ds ipld.DAG
 	bufferedDS := ipld.NewBufferedDAG(ctx, ds)
 
 	return &Adder{
-		ctx:           ctx,
-		pinning:       p,
-		gcLocker:      bs,
-		dagService:    ds,
-		bufferedDS:    bufferedDS,
-		Progress:      false,
-		Pin:           true,
-		Trickle:       false,
-		MaxLinks:      ihelper.DefaultLinksPerBlock,
-		MaxHAMTFanout: uio.DefaultShardWidth,
-		Chunker:       "",
+		ctx:              ctx,
+		pinning:          p,
+		gcLocker:         bs,
+		dagService:       ds,
+		bufferedDS:       bufferedDS,
+		Progress:         false,
+		Pin:              true,
+		Trickle:          false,
+		MaxLinks:         ihelper.DefaultLinksPerBlock,
+		MaxHAMTFanout:    uio.DefaultShardWidth,
+		Chunker:          "",
+		IncludeEmptyDirs: config.DefaultUnixFSIncludeEmptyDirs,
 	}, nil
 }
 
 // Adder holds the switches passed to the `add` command.
 type Adder struct {
-	ctx               context.Context
-	pinning           pin.Pinner
-	gcLocker          bstore.GCLocker
-	dagService        ipld.DAGService
-	bufferedDS        *ipld.BufferedDAG
-	Out               chan<- interface{}
-	Progress          bool
-	Pin               bool
-	PinName           string
-	Trickle           bool
-	RawLeaves         bool
-	MaxLinks          int
-	MaxDirectoryLinks int
-	MaxHAMTFanout     int
-	Silent            bool
-	NoCopy            bool
-	Chunker           string
-	mroot             *mfs.Root
-	unlocker          bstore.Unlocker
-	tempRoot          cid.Cid
-	CidBuilder        cid.Builder
-	liveNodes         uint64
+	ctx                context.Context
+	pinning            pin.Pinner
+	gcLocker           bstore.GCLocker
+	dagService         ipld.DAGService
+	bufferedDS         *ipld.BufferedDAG
+	Out                chan<- any
+	Progress           bool
+	Pin                bool
+	PinName            string
+	Trickle            bool
+	RawLeaves          bool
+	MaxLinks           int
+	MaxDirectoryLinks  int
+	MaxHAMTFanout      int
+	SizeEstimationMode *uio.SizeEstimationMode
+	Silent             bool
+	NoCopy             bool
+	Chunker            string
+	mroot              *mfs.Root
+	unlocker           bstore.Unlocker
+	tempRoot           cid.Cid
+	CidBuilder         cid.Builder
+	liveNodes          uint64
 
-	PreserveMode  bool
-	PreserveMtime bool
-	FileMode      os.FileMode
-	FileMtime     time.Time
+	PreserveMode     bool
+	PreserveMtime    bool
+	FileMode         os.FileMode
+	FileMtime        time.Time
+	IncludeEmptyDirs bool
 }
 
 func (adder *Adder) mfsRoot() (*mfs.Root, error) {
@@ -103,11 +107,7 @@ func (adder *Adder) mfsRoot() (*mfs.Root, error) {
 	}
 
 	// Note, this adds it to DAGService already.
-	mr, err := mfs.NewEmptyRoot(adder.ctx, adder.dagService, nil, nil, mfs.MkdirOpts{
-		CidBuilder:    adder.CidBuilder,
-		MaxLinks:      adder.MaxDirectoryLinks,
-		MaxHAMTFanout: adder.MaxHAMTFanout,
-	})
+	mr, err := mfs.NewEmptyRoot(adder.ctx, adder.dagService, nil, nil, adder.mkdirOpts()...)
 	if err != nil {
 		return nil, err
 	}
@@ -118,6 +118,20 @@ func (adder *Adder) mfsRoot() (*mfs.Root, error) {
 // SetMfsRoot sets `r` as the root for Adder.
 func (adder *Adder) SetMfsRoot(r *mfs.Root) {
 	adder.mroot = r
+}
+
+// mkdirOpts returns MFS options derived from the adder's config,
+// with any additional options appended.
+func (adder *Adder) mkdirOpts(extra ...mfs.Option) []mfs.Option {
+	opts := []mfs.Option{
+		mfs.WithCidBuilder(adder.CidBuilder),
+		mfs.WithMaxLinks(adder.MaxDirectoryLinks),
+		mfs.WithMaxHAMTFanout(adder.MaxHAMTFanout),
+	}
+	if adder.SizeEstimationMode != nil {
+		opts = append(opts, mfs.WithSizeEstimationMode(*adder.SizeEstimationMode))
+	}
+	return append(opts, extra...)
 }
 
 // Constructs a node from reader's data, and adds it. Doesn't pin.
@@ -269,14 +283,8 @@ func (adder *Adder) addNode(node ipld.Node, path string) error {
 
 	dir := gopath.Dir(path)
 	if dir != "." {
-		opts := mfs.MkdirOpts{
-			Mkparents:     true,
-			Flush:         false,
-			CidBuilder:    adder.CidBuilder,
-			MaxLinks:      adder.MaxDirectoryLinks,
-			MaxHAMTFanout: adder.MaxHAMTFanout,
-		}
-		if err := mfs.Mkdir(mr, dir, opts); err != nil {
+		mkdirOpts := adder.mkdirOpts()
+		if err := mfs.Mkdir(mr, dir, mfs.MkdirOpts{Mkparents: true, Flush: false}, mkdirOpts...); err != nil {
 			return err
 		}
 	}
@@ -480,16 +488,28 @@ func (adder *Adder) addFile(path string, file files.File) error {
 func (adder *Adder) addDir(ctx context.Context, path string, dir files.Directory, toplevel bool) error {
 	log.Infof("adding directory: %s", path)
 
+	// Peek at first entry to check if directory is empty.
+	// We advance the iterator once here and continue from this position
+	// in the processing loop below. This avoids allocating a slice to
+	// collect all entries just to check for emptiness.
+	it := dir.Entries()
+	hasEntry := it.Next()
+	if !hasEntry {
+		if err := it.Err(); err != nil {
+			return err
+		}
+		// Directory is empty. Skip it unless IncludeEmptyDirs is set or
+		// this is the toplevel directory (we always include the root).
+		if !adder.IncludeEmptyDirs && !toplevel {
+			log.Debugf("skipping empty directory: %s", path)
+			return nil
+		}
+	}
+
 	// if we need to store mode or modification time then create a new root which includes that data
 	if toplevel && (adder.FileMode != 0 || !adder.FileMtime.IsZero()) {
-		mr, err := mfs.NewEmptyRoot(ctx, adder.dagService, nil, nil,
-			mfs.MkdirOpts{
-				CidBuilder:    adder.CidBuilder,
-				MaxLinks:      adder.MaxDirectoryLinks,
-				MaxHAMTFanout: adder.MaxHAMTFanout,
-				ModTime:       adder.FileMtime,
-				Mode:          adder.FileMode,
-			})
+		opts := adder.mkdirOpts(mfs.WithMode(adder.FileMode), mfs.WithModTime(adder.FileMtime))
+		mr, err := mfs.NewEmptyRoot(ctx, adder.dagService, nil, nil, opts...)
 		if err != nil {
 			return err
 		}
@@ -501,27 +521,21 @@ func (adder *Adder) addDir(ctx context.Context, path string, dir files.Directory
 		if err != nil {
 			return err
 		}
-		err = mfs.Mkdir(mr, path, mfs.MkdirOpts{
-			Mkparents:     true,
-			Flush:         false,
-			CidBuilder:    adder.CidBuilder,
-			Mode:          adder.FileMode,
-			ModTime:       adder.FileMtime,
-			MaxLinks:      adder.MaxDirectoryLinks,
-			MaxHAMTFanout: adder.MaxHAMTFanout,
-		})
+		mkdirOpts := adder.mkdirOpts(mfs.WithMode(adder.FileMode), mfs.WithModTime(adder.FileMtime))
+		err = mfs.Mkdir(mr, path, mfs.MkdirOpts{Mkparents: true, Flush: false}, mkdirOpts...)
 		if err != nil {
 			return err
 		}
 	}
 
-	it := dir.Entries()
-	for it.Next() {
+	// Process directory entries. The iterator was already advanced once above
+	// to peek for emptiness, so we start from that position.
+	for hasEntry {
 		fpath := gopath.Join(path, it.Name())
-		err := adder.addFileNode(ctx, fpath, it.Node(), false)
-		if err != nil {
+		if err := adder.addFileNode(ctx, fpath, it.Node(), false); err != nil {
 			return err
 		}
+		hasEntry = it.Next()
 	}
 
 	return it.Err()
@@ -549,7 +563,7 @@ func (adder *Adder) maybePauseForGC(ctx context.Context) error {
 }
 
 // outputDagnode sends dagnode info over the output channel
-func outputDagnode(out chan<- interface{}, name string, dn ipld.Node) error {
+func outputDagnode(out chan<- any, name string, dn ipld.Node) error {
 	if out == nil {
 		return nil
 	}
@@ -587,7 +601,7 @@ func getOutput(dagnode ipld.Node) (*coreiface.AddEvent, error) {
 type progressReader struct {
 	file         io.Reader
 	path         string
-	out          chan<- interface{}
+	out          chan<- any
 	bytes        int64
 	lastProgress int64
 }

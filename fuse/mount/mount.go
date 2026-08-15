@@ -66,6 +66,9 @@ func UnmountCmd(point string) (*exec.Cmd, error) {
 	case "darwin":
 		return exec.Command("diskutil", "umount", "force", point), nil
 	case "linux":
+		if _, err := exec.LookPath("fusermount3"); err == nil {
+			return exec.Command("fusermount3", "-u", point), nil
+		}
 		return exec.Command("fusermount", "-u", point), nil
 	default:
 		return nil, fmt.Errorf("unmount: unimplemented")
@@ -77,7 +80,7 @@ func UnmountCmd(point string) (*exec.Cmd, error) {
 // Attempts a given number of times.
 func ForceUnmountManyTimes(m Mount, attempts int) error {
 	var err error
-	for i := 0; i < attempts; i++ {
+	for range attempts {
 		err = ForceUnmount(m)
 		if err == nil {
 			return err

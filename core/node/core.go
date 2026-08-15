@@ -27,8 +27,12 @@ import (
 
 	"github.com/ipfs/kubo/config"
 	"github.com/ipfs/kubo/core/node/helpers"
+	"github.com/ipfs/kubo/core/shutdown"
 	"github.com/ipfs/kubo/repo"
 )
+
+// FilesRootDatastoreKey is the datastore key for the MFS files root CID.
+var FilesRootDatastoreKey = datastore.NewKey("/local/filesroot")
 
 // BlockService creates new blockservice which provides an interface to fetch content-addressable blocks
 func BlockService(cfg *config.Config) func(lc fx.Lifecycle, bs blockstore.Blockstore, rem exchange.Interface) blockservice.BlockService {
@@ -39,7 +43,7 @@ func BlockService(cfg *config.Config) func(lc fx.Lifecycle, bs blockstore.Blocks
 
 		lc.Append(fx.Hook{
 			OnStop: func(ctx context.Context) error {
-				return bsvc.Close()
+				return shutdown.CloseWithCtx(ctx, "blockservice", bsvc.Close)
 			},
 		})
 
@@ -47,14 +51,19 @@ func BlockService(cfg *config.Config) func(lc fx.Lifecycle, bs blockstore.Blocks
 	}
 }
 
-// Pinning creates new pinner which tells GC which blocks should be kept
-func Pinning(strategy string) func(bstore blockstore.Blockstore, ds format.DAGService, repo repo.Repo, prov DHTProvider) (pin.Pinner, error) {
-	// Parse strategy at function creation time (not inside the returned function)
-	// This happens before the provider is created, which is why we pass the strategy
-	// string and parse it here, rather than using fx-provided ProvidingStrategy.
-	strategyFlag := config.ParseProvideStrategy(strategy)
+// Pinning builds the pinner that GC uses to decide which blocks to keep.
+//
+// An fx OnStop hook closes the pinner before the repo (and its
+// datastore). The order matters: in-flight pinner operations hold a
+// reference to the datastore, and some datastores (pebble) panic on
+// use after Close. Pinner.Close cancels those operations and waits
+// for them to return. See
+// [github.com/ipfs/boxo/pinning/pinner.Pinner.Close].
+func Pinning(strategy string) func(lc fx.Lifecycle, bstore blockstore.Blockstore, ds format.DAGService, repo repo.Repo, prov DHTProvider) (pin.Pinner, error) {
+	strategyFlag := config.MustParseProvideStrategy(strategy)
 
-	return func(bstore blockstore.Blockstore,
+	return func(lc fx.Lifecycle,
+		bstore blockstore.Blockstore,
 		ds format.DAGService,
 		repo repo.Repo,
 		prov DHTProvider,
@@ -90,6 +99,21 @@ func Pinning(strategy string) func(bstore blockstore.Blockstore, ds format.DAGSe
 		if err != nil {
 			return nil, err
 		}
+
+		// fx runs OnStop hooks in reverse registration order. The
+		// repo provider registers its close hook earlier (in
+		// builder.go), so this hook runs first and the repo hook
+		// runs after, without an explicit dependency between them.
+		//
+		// Wrapped with CloseWithCtx because the boxo Pinner.Close
+		// contract notes that an in-flight op which ignores its ctx
+		// (a downstream bug) can block Close; the host must bound it
+		// at the call site so the shutdown deadline is honored.
+		lc.Append(fx.Hook{
+			OnStop: func(ctx context.Context) error {
+				return shutdown.CloseWithCtx(ctx, "pinner", pinning.Close)
+			},
+		})
 
 		return pinning, nil
 	}
@@ -181,7 +205,6 @@ func Dag(bs blockservice.BlockService) format.DAGService {
 // Files loads persisted MFS root
 func Files(strategy string) func(mctx helpers.MetricsCtx, lc fx.Lifecycle, repo repo.Repo, dag format.DAGService, bs blockstore.Blockstore, prov DHTProvider) (*mfs.Root, error) {
 	return func(mctx helpers.MetricsCtx, lc fx.Lifecycle, repo repo.Repo, dag format.DAGService, bs blockstore.Blockstore, prov DHTProvider) (*mfs.Root, error) {
-		dsk := datastore.NewKey("/local/filesroot")
 		pf := func(ctx context.Context, c cid.Cid) error {
 			rootDS := repo.Datastore()
 			if err := rootDS.Sync(ctx, blockstore.BlockPrefix); err != nil {
@@ -191,15 +214,15 @@ func Files(strategy string) func(mctx helpers.MetricsCtx, lc fx.Lifecycle, repo 
 				return err
 			}
 
-			if err := rootDS.Put(ctx, dsk, c.Bytes()); err != nil {
+			if err := rootDS.Put(ctx, FilesRootDatastoreKey, c.Bytes()); err != nil {
 				return err
 			}
-			return rootDS.Sync(ctx, dsk)
+			return rootDS.Sync(ctx, FilesRootDatastoreKey)
 		}
 
 		var nd *merkledag.ProtoNode
 		ctx := helpers.LifecycleCtx(mctx, lc)
-		val, err := repo.Datastore().Get(ctx, dsk)
+		val, err := repo.Datastore().Get(ctx, FilesRootDatastoreKey)
 
 		switch {
 		case errors.Is(err, datastore.ErrNotFound):
@@ -236,19 +259,40 @@ func Files(strategy string) func(mctx helpers.MetricsCtx, lc fx.Lifecycle, repo 
 		// strategy - it ensures all MFS content gets announced as it's added or
 		// modified. For non-mfs strategies, we set provider to nil to avoid
 		// unnecessary providing.
-		strategyFlag := config.ParseProvideStrategy(strategy)
+		strategyFlag := config.MustParseProvideStrategy(strategy)
 		if strategyFlag&config.ProvideStrategyMFS == 0 {
 			prov = nil
 		}
 
-		root, err := mfs.NewRoot(ctx, dag, nd, pf, prov)
+		// Get configured settings from Import config
+		cfg, err := repo.Config()
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("failed to get config: %w", err)
+		}
+		mfsOpts, err := cfg.Import.MFSRootOptions()
+		if err != nil {
+			return nil, fmt.Errorf("failed to build MFS options from Import config: %w", err)
+		}
+
+		// Keep dag here an online (network-backed) DAGService. "ipfs files cp
+		// /ipfs/<cid> /path" stores a lazy pointer: only the referenced root is
+		// fetched, and its children are pulled from the network on demand when
+		// the tree is later traversed ("files ls -l", or "stat"/"read" of a
+		// subpath). Do NOT swap in an offline/local-only DAGService to avoid an
+		// under-lock bitswap hang, that turns those lazy lookups into "block not
+		// found locally" errors. The GC-vs-MFS wedge that tempts that change
+		// (ipfs/kubo#10842) is fixed on the GC side instead: MFS mutations hold
+		// the pin lock and GC snapshots the MFS root under the GC lock, so live
+		// MFS blocks are never collected out from under an in-flight write.
+		root, err := mfs.NewRoot(ctx, dag, nd, pf, prov, mfsOpts...)
+		if err != nil {
+			return nil, fmt.Errorf("failed to initialize MFS root from %s stored at %s: %w. "+
+				"If corrupted, use 'ipfs files chroot' to reset (see --help)", nd.Cid(), FilesRootDatastoreKey, err)
 		}
 
 		lc.Append(fx.Hook{
 			OnStop: func(ctx context.Context) error {
-				return root.Close()
+				return shutdown.CloseWithCtx(ctx, "mfs-root", root.Close)
 			},
 		})
 

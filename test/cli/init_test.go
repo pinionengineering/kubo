@@ -130,7 +130,7 @@ func TestInit(t *testing.T) {
 		node := harness.NewT(t).NewNode().Init("--profile=server")
 
 		lines := node.IPFS("config", "Swarm.AddrFilters").Stdout.Lines()
-		assert.Len(t, lines, 18)
+		assert.Len(t, lines, 21)
 
 		out := node.IPFS("config", "Bootstrap").Stdout.Trimmed()
 		assert.Equal(t, "[]", out)
@@ -155,6 +155,7 @@ func TestInit(t *testing.T) {
 	t.Run("ipfs init should not run while daemon is running", func(t *testing.T) {
 		t.Parallel()
 		node := harness.NewT(t).NewNode().Init().StartDaemon()
+		defer node.StopDaemon()
 		res := node.RunIPFS("init")
 		assert.NotEqual(t, 0, res.ExitErr.ExitCode())
 		assert.Contains(t, res.Stderr.String(), "Error: ipfs daemon is running. please stop it to run this command")

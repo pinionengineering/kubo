@@ -29,7 +29,7 @@ type key struct {
 func newKey(name string, pid peer.ID) (*key, error) {
 	p, err := path.NewPath("/ipns/" + ipns.NameFromPeer(pid).String())
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("cannot create new key: %w", err)
 	}
 	return &key{
 		name:   name,
@@ -73,6 +73,10 @@ func (api *KeyAPI) Generate(ctx context.Context, name string, opts ...caopts.Key
 		return nil, fmt.Errorf("key with name '%s' already exists", name)
 	}
 
+	if err := caopts.CheckKeySize(options.Algorithm, options.Size); err != nil {
+		return nil, err
+	}
+
 	var sk crypto.PrivKey
 	var pk crypto.PubKey
 
@@ -91,6 +95,14 @@ func (api *KeyAPI) Generate(ctx context.Context, name string, opts ...caopts.Key
 		pk = pub
 	case "ed25519":
 		priv, pub, err := crypto.GenerateEd25519Key(rand.Reader)
+		if err != nil {
+			return nil, err
+		}
+
+		sk = priv
+		pk = pub
+	case "secp256k1":
+		priv, pub, err := crypto.GenerateSecp256k1Key(rand.Reader)
 		if err != nil {
 			return nil, err
 		}
@@ -121,34 +133,37 @@ func (api *KeyAPI) List(ctx context.Context) ([]coreiface.Key, error) {
 
 	keys, err := api.repo.Keystore().List()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("cannot list keys in keystore: %w", err)
 	}
 
 	sort.Strings(keys)
 
-	out := make([]coreiface.Key, len(keys)+1)
+	out := make([]coreiface.Key, 1, len(keys)+1)
 	out[0], err = newKey("self", api.identity)
 	if err != nil {
 		return nil, err
 	}
 
-	for n, k := range keys {
+	for _, k := range keys {
 		privKey, err := api.repo.Keystore().Get(k)
 		if err != nil {
-			return nil, err
+			log.Errorf("cannot get key from keystore: %s", err)
+			continue
 		}
 
 		pubKey := privKey.GetPublic()
 
 		pid, err := peer.IDFromPublicKey(pubKey)
 		if err != nil {
-			return nil, err
+			log.Errorf("cannot decode public key: %s", err)
+			continue
 		}
 
-		out[n+1], err = newKey(k, pid)
+		k, err := newKey(k, pid)
 		if err != nil {
 			return nil, err
 		}
+		out = append(out, k)
 	}
 	return out, nil
 }

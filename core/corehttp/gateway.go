@@ -5,8 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"net/http"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/ipfs/boxo/blockservice"
@@ -22,8 +25,10 @@ import (
 	"github.com/ipfs/kubo/core"
 	iface "github.com/ipfs/kubo/core/coreiface"
 	"github.com/ipfs/kubo/core/node"
+	irouting "github.com/ipfs/kubo/routing"
 	"github.com/libp2p/go-libp2p/core/routing"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel/attribute"
 )
 
 func GatewayOption(paths ...string) ServeOption {
@@ -40,6 +45,9 @@ func GatewayOption(paths ...string) ServeOption {
 
 		handler := gateway.NewHandler(config, backend)
 		handler = gateway.NewHeaders(headers).ApplyCors().Wrap(handler)
+		if fn := newServerDomainAttrFn(n); fn != nil {
+			handler = withMetricLabels(handler, fn)
+		}
 		handler = otelhttp.NewHandler(handler, "Gateway")
 
 		for _, p := range paths {
@@ -67,6 +75,9 @@ func HostnameOption() ServeOption {
 		var handler http.Handler
 		handler = gateway.NewHostnameHandler(config, backend, childMux)
 		handler = gateway.NewHeaders(headers).ApplyCors().Wrap(handler)
+		if fn := newServerDomainAttrFn(n); fn != nil {
+			handler = withMetricLabels(handler, fn)
+		}
 		handler = otelhttp.NewHandler(handler, "HostnameGateway")
 
 		mux.Handle("/", handler)
@@ -112,13 +123,14 @@ func Libp2pGatewayOption() ServeOption {
 			Menu:                  nil,
 			// Apply timeout and concurrency limits from user config
 			RetrievalTimeout:        cfg.Gateway.RetrievalTimeout.WithDefault(config.DefaultRetrievalTimeout),
+			MaxRequestDuration:      cfg.Gateway.MaxRequestDuration.WithDefault(config.DefaultMaxRequestDuration),
 			MaxConcurrentRequests:   int(cfg.Gateway.MaxConcurrentRequests.WithDefault(int64(config.DefaultMaxConcurrentRequests))),
 			MaxRangeRequestFileSize: int64(cfg.Gateway.MaxRangeRequestFileSize.WithDefault(uint64(config.DefaultMaxRangeRequestFileSize))),
 			DiagnosticServiceURL:    "", // Not used since DisableHTMLErrors=true
 		}
 
 		handler := gateway.NewHandler(gwConfig, &offlineGatewayErrWrapper{gwimpl: backend})
-		handler = otelhttp.NewHandler(handler, "Libp2p-Gateway")
+		handler = otelhttp.NewHandler(withMetricLabels(handler, staticServerDomainAttrFn("libp2p")), "Libp2p-Gateway")
 
 		mux.Handle("/ipfs/", handler)
 
@@ -155,7 +167,7 @@ func newGatewayBackend(n *core.IpfsNode) (gateway.IPFSBackend, error) {
 			namesys.WithMaxCacheTTL(cfg.Ipns.MaxCacheTTL.WithDefault(config.DefaultIpnsMaxCacheTTL)),
 		}
 
-		vsRouting = offlineroute.NewOfflineRouter(n.Repo.Datastore(), n.RecordValidator)
+		vsRouting = offlineroute.NewOfflineRouter(irouting.DHTValueDatastore(n.Repo.Datastore()), n.RecordValidator)
 		nsys, err = namesys.NewNameSystem(vsRouting, nsOptions...)
 		if err != nil {
 			return nil, fmt.Errorf("error constructing namesys: %w", err)
@@ -250,6 +262,108 @@ var _ gateway.IPFSBackend = (*offlineGatewayErrWrapper)(nil)
 
 var defaultPaths = []string{"/ipfs/", "/ipns/", "/p2p/"}
 
+// serverDomainAttrKey is the OTel attribute key for the logical server domain.
+// It replaces the high-cardinality server.address attribute (dropped by the
+// View in cmd/ipfs/kubo/daemon.go) with a bounded set of values: configured
+// Gateway.PublicGateways suffixes, "localhost", "loopback", "api", "libp2p",
+// or "other".
+var serverDomainAttrKey = attribute.Key("server.domain")
+
+// withMetricLabels wraps a handler so that otelhttp metric attributes are
+// added via the request-scoped [otelhttp.Labeler] instead of the deprecated
+// [otelhttp.WithMetricAttributesFn] option. The wrapper must run inside
+// [otelhttp.NewHandler] (which injects the labeler into the context).
+func withMetricLabels(next http.Handler, fn func(*http.Request) []attribute.KeyValue) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if l, ok := otelhttp.LabelerFromContext(r.Context()); ok {
+			l.Add(fn(r)...)
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// staticServerDomainAttrFn returns a MetricAttributesFn that always returns
+// a fixed server.domain value. Use for handlers where the domain is known
+// statically (e.g. "api", "libp2p") to keep the label set consistent across
+// all http_server_* metrics.
+func staticServerDomainAttrFn(domain string) func(*http.Request) []attribute.KeyValue {
+	attrs := []attribute.KeyValue{serverDomainAttrKey.String(domain)}
+	return func(*http.Request) []attribute.KeyValue { return attrs }
+}
+
+// newServerDomainAttrFn returns an attribute callback for [withMetricLabels]
+// that adds a server.domain attribute grouping requests by their matching
+// Gateway.PublicGateways hostname suffix (e.g. "dweb.link", "ipfs.io").
+// Requests that don't match any configured gateway get "other".
+//
+// All return values are pre-allocated at setup time so the per-request
+// closure is zero-allocation.
+func newServerDomainAttrFn(n *core.IpfsNode) func(*http.Request) []attribute.KeyValue {
+	cfg, err := n.Repo.Config()
+	if err != nil {
+		return nil
+	}
+
+	// Collect non-nil gateway domain suffixes, sorted longest-first
+	// so more-specific suffixes match before shorter ones.
+	// Strip ports from keys to match boxo's fallback behavior
+	// (boxo tries exact match with port, then strips port and retries).
+	seen := make(map[string]struct{}, len(cfg.Gateway.PublicGateways))
+	suffixes := make([]string, 0, len(cfg.Gateway.PublicGateways))
+	for hostname, gw := range cfg.Gateway.PublicGateways {
+		if gw == nil {
+			continue
+		}
+		if h, _, err := net.SplitHostPort(hostname); err == nil {
+			hostname = h
+		}
+		if _, ok := seen[hostname]; ok {
+			continue
+		}
+		seen[hostname] = struct{}{}
+		suffixes = append(suffixes, hostname)
+	}
+	slices.SortFunc(suffixes, func(a, b string) int {
+		return len(b) - len(a)
+	})
+
+	// Pre-allocate attribute slices so the per-request closure only returns
+	// existing slices and does not allocate.
+	suffixAttrs := make([][]attribute.KeyValue, len(suffixes))
+	for i, s := range suffixes {
+		suffixAttrs[i] = []attribute.KeyValue{serverDomainAttrKey.String(s)}
+	}
+	localhostAttr := []attribute.KeyValue{serverDomainAttrKey.String("localhost")}
+	loopbackAttr := []attribute.KeyValue{serverDomainAttrKey.String("loopback")}
+	otherAttr := []attribute.KeyValue{serverDomainAttrKey.String("other")}
+
+	return func(r *http.Request) []attribute.KeyValue {
+		host := r.Host
+		if h, _, err := net.SplitHostPort(host); err == nil {
+			host = h
+		}
+
+		// Check localhost/loopback before iterating suffixes.
+		// "localhost" is an implicit default gateway (defaultKnownGateways)
+		// not present in cfg.Gateway.PublicGateways, so it won't appear
+		// in suffixes.
+		if host == "localhost" || strings.HasSuffix(host, ".localhost") {
+			return localhostAttr
+		}
+		if strings.HasPrefix(host, "127.") || host == "::1" {
+			return loopbackAttr
+		}
+
+		for i, suffix := range suffixes {
+			if strings.HasSuffix(host, suffix) {
+				return suffixAttrs[i]
+			}
+		}
+
+		return otherAttr
+	}
+}
+
 var subdomainGatewaySpec = &gateway.PublicGateway{
 	Paths:         defaultPaths,
 	UseSubdomains: true,
@@ -268,19 +382,19 @@ func getGatewayConfig(n *core.IpfsNode) (gateway.Config, map[string][]string, er
 	// Initialize gateway configuration, with empty PublicGateways, handled after.
 	gwCfg := gateway.Config{
 		DeserializedResponses:   cfg.Gateway.DeserializedResponses.WithDefault(config.DefaultDeserializedResponses),
+		AllowCodecConversion:    cfg.Gateway.AllowCodecConversion.WithDefault(config.DefaultAllowCodecConversion),
 		DisableHTMLErrors:       cfg.Gateway.DisableHTMLErrors.WithDefault(config.DefaultDisableHTMLErrors),
 		NoDNSLink:               cfg.Gateway.NoDNSLink,
 		PublicGateways:          map[string]*gateway.PublicGateway{},
 		RetrievalTimeout:        cfg.Gateway.RetrievalTimeout.WithDefault(config.DefaultRetrievalTimeout),
+		MaxRequestDuration:      cfg.Gateway.MaxRequestDuration.WithDefault(config.DefaultMaxRequestDuration),
 		MaxConcurrentRequests:   int(cfg.Gateway.MaxConcurrentRequests.WithDefault(int64(config.DefaultMaxConcurrentRequests))),
 		MaxRangeRequestFileSize: int64(cfg.Gateway.MaxRangeRequestFileSize.WithDefault(uint64(config.DefaultMaxRangeRequestFileSize))),
 		DiagnosticServiceURL:    cfg.Gateway.DiagnosticServiceURL.WithDefault(config.DefaultDiagnosticServiceURL),
 	}
 
 	// Add default implicit known gateways, such as subdomain gateway on localhost.
-	for hostname, gw := range defaultKnownGateways {
-		gwCfg.PublicGateways[hostname] = gw
-	}
+	maps.Copy(gwCfg.PublicGateways, defaultKnownGateways)
 
 	// Apply values from cfg.Gateway.PublicGateways if they exist.
 	for hostname, gw := range cfg.Gateway.PublicGateways {

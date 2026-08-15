@@ -130,8 +130,8 @@ func DefaultDatastoreConfig() Datastore {
 	}
 }
 
-func pebbleSpec() map[string]interface{} {
-	return map[string]interface{}{
+func pebbleSpec() map[string]any {
+	return map[string]any{
 		"type":               "pebbleds",
 		"prefix":             "pebble.datastore",
 		"path":               "pebbleds",
@@ -139,11 +139,11 @@ func pebbleSpec() map[string]interface{} {
 	}
 }
 
-func pebbleSpecMeasure() map[string]interface{} {
-	return map[string]interface{}{
+func pebbleSpecMeasure() map[string]any {
+	return map[string]any{
 		"type":   "measure",
 		"prefix": "pebble.datastore",
-		"child": map[string]interface{}{
+		"child": map[string]any{
 			"formatMajorVersion": int(pebble.FormatNewest),
 			"type":               "pebbleds",
 			"path":               "pebbleds",
@@ -151,8 +151,8 @@ func pebbleSpecMeasure() map[string]interface{} {
 	}
 }
 
-func badgerSpec() map[string]interface{} {
-	return map[string]interface{}{
+func badgerSpec() map[string]any {
+	return map[string]any{
 		"type":       "badgerds",
 		"prefix":     "badger.datastore",
 		"path":       "badgerds",
@@ -161,11 +161,11 @@ func badgerSpec() map[string]interface{} {
 	}
 }
 
-func badgerSpecMeasure() map[string]interface{} {
-	return map[string]interface{}{
+func badgerSpecMeasure() map[string]any {
+	return map[string]any{
 		"type":   "measure",
 		"prefix": "badger.datastore",
-		"child": map[string]interface{}{
+		"child": map[string]any{
 			"type":       "badgerds",
 			"path":       "badgerds",
 			"syncWrites": false,
@@ -174,26 +174,26 @@ func badgerSpecMeasure() map[string]interface{} {
 	}
 }
 
-func blobSpec(bucket string) map[string]interface{} {
-	return map[string]interface{}{
+func blobSpec(bucket string) map[string]any {
+	return map[string]any{
 		"type": "mount",
-		"mounts": []interface{}{
-			map[string]interface{}{
+		"mounts": []any{
+			map[string]any{
 				"mountpoint": "/blocks",
 				"type":       "measure",
 				"prefix":     "blob.datastore",
-				"child": map[string]interface{}{
+				"child": map[string]any{
 					"type":      "blob",
 					"path":      "blob",
 					"cacheSize": 100000,
 					"bucket":    bucket,
 				},
 			},
-			map[string]interface{}{
+			map[string]any{
 				"mountpoint": "/",
 				"type":       "measure",
 				"prefix":     "leveldb.datastore",
-				"child": map[string]interface{}{
+				"child": map[string]any{
 					"type":        "levelds",
 					"path":        "datastore",
 					"compression": "none",
@@ -203,11 +203,11 @@ func blobSpec(bucket string) map[string]interface{} {
 	}
 }
 
-func flatfsSpec() map[string]interface{} {
-	return map[string]interface{}{
+func flatfsSpec() map[string]any {
+	return map[string]any{
 		"type": "mount",
-		"mounts": []interface{}{
-			map[string]interface{}{
+		"mounts": []any{
+			map[string]any{
 				"mountpoint": "/blocks",
 				"type":       "flatfs",
 				"prefix":     "flatfs.datastore",
@@ -215,7 +215,7 @@ func flatfsSpec() map[string]interface{} {
 				"sync":       false,
 				"shardFunc":  "/repo/flatfs/shard/v1/next-to-last/2",
 			},
-			map[string]interface{}{
+			map[string]any{
 				"mountpoint":  "/",
 				"type":        "levelds",
 				"prefix":      "leveldb.datastore",
@@ -226,26 +226,26 @@ func flatfsSpec() map[string]interface{} {
 	}
 }
 
-func flatfsSpecMeasure() map[string]interface{} {
-	return map[string]interface{}{
+func flatfsSpecMeasure() map[string]any {
+	return map[string]any{
 		"type": "mount",
-		"mounts": []interface{}{
-			map[string]interface{}{
+		"mounts": []any{
+			map[string]any{
 				"mountpoint": "/blocks",
 				"type":       "measure",
 				"prefix":     "flatfs.datastore",
-				"child": map[string]interface{}{
+				"child": map[string]any{
 					"type":      "flatfs",
 					"path":      "blocks",
 					"sync":      false,
 					"shardFunc": "/repo/flatfs/shard/v1/next-to-last/2",
 				},
 			},
-			map[string]interface{}{
+			map[string]any{
 				"mountpoint": "/",
 				"type":       "measure",
 				"prefix":     "leveldb.datastore",
-				"child": map[string]interface{}{
+				"child": map[string]any{
 					"type":        "levelds",
 					"path":        "datastore",
 					"compression": "none",
@@ -262,6 +262,10 @@ func CreateIdentity(out io.Writer, opts []options.KeyGenerateOption) (Identity, 
 
 	settings, err := options.KeyGenerateOptions(opts...)
 	if err != nil {
+		return ident, err
+	}
+
+	if err := options.CheckKeySize(settings.Algorithm, settings.Size); err != nil {
 		return ident, err
 	}
 
@@ -284,11 +288,17 @@ func CreateIdentity(out io.Writer, opts []options.KeyGenerateOption) (Identity, 
 		sk = priv
 		pk = pub
 	case "ed25519":
-		if settings.Size != -1 {
-			return ident, fmt.Errorf("number of key bits does not apply when using ed25519 keys")
-		}
 		fmt.Fprintf(out, "generating ED25519 keypair...")
 		priv, pub, err := crypto.GenerateEd25519Key(rand.Reader)
+		if err != nil {
+			return ident, err
+		}
+
+		sk = priv
+		pk = pub
+	case "secp256k1":
+		fmt.Fprintf(out, "generating secp256k1 keypair...")
+		priv, pub, err := crypto.GenerateSecp256k1Key(rand.Reader)
 		if err != nil {
 			return ident, err
 		}

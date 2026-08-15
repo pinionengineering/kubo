@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/ipfs/boxo/ipld/unixfs/io"
 	mh "github.com/multiformats/go-multihash"
 )
 
@@ -25,25 +26,25 @@ func TestValidateImportConfig_HAMTFanout(t *testing.T) {
 		{name: "valid 1024", fanout: 1024, wantErr: false},
 
 		// Invalid values - not powers of 2
-		{name: "invalid 7", fanout: 7, wantErr: true, errMsg: "must be a positive power of 2, multiple of 8, and not exceed 1024"},
-		{name: "invalid 15", fanout: 15, wantErr: true, errMsg: "must be a positive power of 2, multiple of 8, and not exceed 1024"},
-		{name: "invalid 100", fanout: 100, wantErr: true, errMsg: "must be a positive power of 2, multiple of 8, and not exceed 1024"},
-		{name: "invalid 257", fanout: 257, wantErr: true, errMsg: "must be a positive power of 2, multiple of 8, and not exceed 1024"},
-		{name: "invalid 1000", fanout: 1000, wantErr: true, errMsg: "must be a positive power of 2, multiple of 8, and not exceed 1024"},
+		{name: "invalid 7", fanout: 7, wantErr: true, errMsg: "must be a power of 2, between 8 and 1024"},
+		{name: "invalid 15", fanout: 15, wantErr: true, errMsg: "must be a power of 2, between 8 and 1024"},
+		{name: "invalid 100", fanout: 100, wantErr: true, errMsg: "must be a power of 2, between 8 and 1024"},
+		{name: "invalid 257", fanout: 257, wantErr: true, errMsg: "must be a power of 2, between 8 and 1024"},
+		{name: "invalid 1000", fanout: 1000, wantErr: true, errMsg: "must be a power of 2, between 8 and 1024"},
 
-		// Invalid values - powers of 2 but not multiples of 8
-		{name: "invalid 1", fanout: 1, wantErr: true, errMsg: "must be a positive power of 2, multiple of 8, and not exceed 1024"},
-		{name: "invalid 2", fanout: 2, wantErr: true, errMsg: "must be a positive power of 2, multiple of 8, and not exceed 1024"},
-		{name: "invalid 4", fanout: 4, wantErr: true, errMsg: "must be a positive power of 2, multiple of 8, and not exceed 1024"},
+		// Invalid values - powers of 2 but less than 8
+		{name: "invalid 1", fanout: 1, wantErr: true, errMsg: "must be a power of 2, between 8 and 1024"},
+		{name: "invalid 2", fanout: 2, wantErr: true, errMsg: "must be a power of 2, between 8 and 1024"},
+		{name: "invalid 4", fanout: 4, wantErr: true, errMsg: "must be a power of 2, between 8 and 1024"},
 
 		// Invalid values - exceeds 1024
-		{name: "invalid 2048", fanout: 2048, wantErr: true, errMsg: "must be a positive power of 2, multiple of 8, and not exceed 1024"},
-		{name: "invalid 4096", fanout: 4096, wantErr: true, errMsg: "must be a positive power of 2, multiple of 8, and not exceed 1024"},
+		{name: "invalid 2048", fanout: 2048, wantErr: true, errMsg: "must be a power of 2, between 8 and 1024"},
+		{name: "invalid 4096", fanout: 4096, wantErr: true, errMsg: "must be a power of 2, between 8 and 1024"},
 
 		// Invalid values - negative or zero
-		{name: "invalid 0", fanout: 0, wantErr: true, errMsg: "must be a positive power of 2, multiple of 8, and not exceed 1024"},
-		{name: "invalid -8", fanout: -8, wantErr: true, errMsg: "must be a positive power of 2, multiple of 8, and not exceed 1024"},
-		{name: "invalid -256", fanout: -256, wantErr: true, errMsg: "must be a positive power of 2, multiple of 8, and not exceed 1024"},
+		{name: "invalid 0", fanout: 0, wantErr: true, errMsg: "must be a power of 2, between 8 and 1024"},
+		{name: "invalid -8", fanout: -8, wantErr: true, errMsg: "must be a power of 2, between 8 and 1024"},
+		{name: "invalid -256", fanout: -256, wantErr: true, errMsg: "must be a power of 2, between 8 and 1024"},
 	}
 
 	for _, tt := range tests {
@@ -402,6 +403,196 @@ func TestIsPowerOfTwo(t *testing.T) {
 		t.Run("", func(t *testing.T) {
 			if got := isPowerOfTwo(tt.n); got != tt.want {
 				t.Errorf("isPowerOfTwo(%d) = %v, want %v", tt.n, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestValidateImportConfig_HAMTSizeEstimation(t *testing.T) {
+	tests := []struct {
+		name    string
+		value   string
+		wantErr bool
+		errMsg  string
+	}{
+		{name: "valid links", value: HAMTSizeEstimationLinks, wantErr: false},
+		{name: "valid block", value: HAMTSizeEstimationBlock, wantErr: false},
+		{name: "valid disabled", value: HAMTSizeEstimationDisabled, wantErr: false},
+		{name: "invalid unknown", value: "unknown", wantErr: true, errMsg: "must be"},
+		{name: "invalid empty", value: "", wantErr: true, errMsg: "must be"},
+		{name: "invalid typo", value: "link", wantErr: true, errMsg: "must be"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &Import{
+				UnixFSHAMTDirectorySizeEstimation: *NewOptionalString(tt.value),
+			}
+
+			err := ValidateImportConfig(cfg)
+
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("expected error for value=%q, got nil", tt.value)
+				} else if tt.errMsg != "" && !strings.Contains(err.Error(), tt.errMsg) {
+					t.Errorf("error = %v, want error containing %q", err, tt.errMsg)
+				}
+			} else {
+				if err != nil {
+					t.Errorf("unexpected error for value=%q: %v", tt.value, err)
+				}
+			}
+		})
+	}
+}
+
+func TestValidateImportConfig_DAGLayout(t *testing.T) {
+	tests := []struct {
+		name    string
+		value   string
+		wantErr bool
+		errMsg  string
+	}{
+		{name: "valid balanced", value: DAGLayoutBalanced, wantErr: false},
+		{name: "valid trickle", value: DAGLayoutTrickle, wantErr: false},
+		{name: "invalid unknown", value: "unknown", wantErr: true, errMsg: "must be"},
+		{name: "invalid empty", value: "", wantErr: true, errMsg: "must be"},
+		{name: "invalid flat", value: "flat", wantErr: true, errMsg: "must be"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &Import{
+				UnixFSDAGLayout: *NewOptionalString(tt.value),
+			}
+
+			err := ValidateImportConfig(cfg)
+
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("expected error for value=%q, got nil", tt.value)
+				} else if tt.errMsg != "" && !strings.Contains(err.Error(), tt.errMsg) {
+					t.Errorf("error = %v, want error containing %q", err, tt.errMsg)
+				}
+			} else {
+				if err != nil {
+					t.Errorf("unexpected error for value=%q: %v", tt.value, err)
+				}
+			}
+		})
+	}
+}
+
+func TestImport_UnixFSCidBuilder(t *testing.T) {
+	defaultMhType := mh.Names[strings.ToLower(DefaultHashFunction)]
+
+	tests := []struct {
+		name       string
+		cfg        Import
+		wantCidVer uint64
+		wantMhType uint64
+	}{
+		{
+			name:       "CIDv1 explicit",
+			cfg:        Import{CidVersion: *NewOptionalInteger(1)},
+			wantCidVer: 1,
+			wantMhType: defaultMhType,
+		},
+		{
+			name:       "CIDv0 explicit",
+			cfg:        Import{CidVersion: *NewOptionalInteger(0)},
+			wantCidVer: 0,
+			wantMhType: defaultMhType,
+		},
+		{
+			name:       "non-default hash upgrades CIDv0 to CIDv1",
+			cfg:        Import{HashFunction: *NewOptionalString("sha2-512")},
+			wantCidVer: 1,
+			wantMhType: mh.SHA2_512,
+		},
+		{
+			name: "CIDv1 with sha2-512",
+			cfg: Import{
+				CidVersion:   *NewOptionalInteger(1),
+				HashFunction: *NewOptionalString("sha2-512"),
+			},
+			wantCidVer: 1,
+			wantMhType: mh.SHA2_512,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			builder, err := tt.cfg.UnixFSCidBuilder()
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if builder == nil {
+				t.Fatal("expected non-nil builder")
+			}
+			c, err := builder.Sum([]byte("test"))
+			if err != nil {
+				t.Fatalf("builder.Sum failed: %v", err)
+			}
+			pref := c.Prefix()
+			if pref.Version != tt.wantCidVer {
+				t.Errorf("CID version = %d, want %d", pref.Version, tt.wantCidVer)
+			}
+			if pref.MhType != tt.wantMhType {
+				t.Errorf("multihash type = 0x%x, want 0x%x", pref.MhType, tt.wantMhType)
+			}
+		})
+	}
+}
+
+// TestImport_UnixFSCidBuilderDefaults verifies that UnixFSCidBuilder always
+// returns an explicit builder even when no config is set, so that MFS
+// respects kubo's DefaultCidVersion rather than relying on boxo's internal
+// CIDv0 default (relevant for https://github.com/ipfs/kubo/issues/4143).
+func TestImport_UnixFSCidBuilderDefaults(t *testing.T) {
+	cfg := &Import{}
+	builder, err := cfg.UnixFSCidBuilder()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if builder == nil {
+		t.Fatal("expected non-nil builder at defaults")
+	}
+	c, err := builder.Sum([]byte("test"))
+	if err != nil {
+		t.Fatalf("builder.Sum failed: %v", err)
+	}
+	pref := c.Prefix()
+	if pref.Version != uint64(DefaultCidVersion) {
+		t.Errorf("CID version = %d, want DefaultCidVersion (%d)", pref.Version, DefaultCidVersion)
+	}
+	wantMhType := mh.Names[strings.ToLower(DefaultHashFunction)]
+	if pref.MhType != wantMhType {
+		t.Errorf("multihash type = 0x%x, want 0x%x (DefaultHashFunction=%s)", pref.MhType, wantMhType, DefaultHashFunction)
+	}
+}
+
+func TestImport_HAMTSizeEstimationMode(t *testing.T) {
+	tests := []struct {
+		cfg  string
+		want io.SizeEstimationMode
+	}{
+		{HAMTSizeEstimationLinks, io.SizeEstimationLinks},
+		{HAMTSizeEstimationBlock, io.SizeEstimationBlock},
+		{HAMTSizeEstimationDisabled, io.SizeEstimationDisabled},
+		{"", io.SizeEstimationLinks},        // default (unset returns default)
+		{"unknown", io.SizeEstimationLinks}, // fallback to default
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.cfg, func(t *testing.T) {
+			var imp Import
+			if tt.cfg != "" {
+				imp.UnixFSHAMTDirectorySizeEstimation = *NewOptionalString(tt.cfg)
+			}
+			got := imp.HAMTSizeEstimationMode()
+			if got != tt.want {
+				t.Errorf("Import.HAMTSizeEstimationMode() with %q = %v, want %v", tt.cfg, got, tt.want)
 			}
 		})
 	}

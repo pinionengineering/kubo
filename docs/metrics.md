@@ -110,9 +110,16 @@ Additional HTTP instrumentation for all handlers (Gateway, API commands, etc.):
 
 These metrics are automatically added to Gateway handlers, Hostname Gateway, Libp2p Gateway, and API command handlers.
 
+> [!NOTE]
+> The `server_address` label from `otelhttp` is dropped via an OTel SDK View to prevent cardinality explosion on subdomain gateways (where each unique `Host` header creates a new time series). All handlers include a `server_domain` label instead:
+>
+> - Gateway and Hostname Gateway handlers group requests by their matching [`Gateway.PublicGateways`](config.md#gatewaypublicgateways) domain suffix (e.g., `dweb.link`, `ipfs.io`). Unmatched hosts are labeled `localhost`, `loopback`, or `other`.
+> - The RPC API handler uses `api`.
+> - The Libp2p Gateway handler uses `libp2p`.
+
 ## OpenTelemetry Metadata
 
 Kubo uses Prometheus for metrics collection for historical reasons, but OpenTelemetry metrics are automatically exposed through the same Prometheus endpoint. These metadata metrics provide context about the instrumentation:
 
-- `otel_scope_info` - Information about instrumentation libraries producing metrics
+- `otel_scope_name`, `otel_scope_version`, `otel_scope_schema_url` - Per-metric labels identifying the instrumentation library that produced each metric
 - `target_info` - Service metadata including version and instance information

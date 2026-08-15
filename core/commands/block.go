@@ -67,6 +67,11 @@ on raw IPFS blocks. It outputs the following to stdout:
 			return err
 		}
 
+		enc, err := cmdenv.GetCidEncoder(req)
+		if err != nil {
+			return err
+		}
+
 		p, err := cmdutils.PathOrCidPath(req.Arguments[0])
 		if err != nil {
 			return err
@@ -78,7 +83,7 @@ on raw IPFS blocks. It outputs the following to stdout:
 		}
 
 		return cmds.EmitOnce(res, &BlockStat{
-			Key:  b.Path().RootCid().String(),
+			Key:  enc.Encode(b.Path().RootCid()),
 			Size: b.Size(),
 		})
 	},
@@ -98,6 +103,9 @@ var blockGetCmd = &cmds.Command{
 'ipfs block get' is a plumbing command for retrieving raw IPFS blocks.
 It takes a <cid>, and outputs the block to stdout.
 `,
+		HTTP: &cmds.HTTPHelpText{
+			ResponseContentType: "application/vnd.ipld.raw",
+		},
 	},
 
 	Arguments: []cmds.Argument{
@@ -119,6 +127,8 @@ It takes a <cid>, and outputs the block to stdout.
 			return err
 		}
 
+		res.SetEncodingType(cmds.OctetStream)
+		res.SetContentType("application/vnd.ipld.raw")
 		return res.Emit(r)
 	},
 }
@@ -162,6 +172,11 @@ only for backward compatibility when a legacy CIDv0 is required (--format=v0).
 	},
 	Run: func(req *cmds.Request, res cmds.ResponseEmitter, env cmds.Environment) error {
 		api, err := cmdenv.GetApi(env, req)
+		if err != nil {
+			return err
+		}
+
+		enc, err := cmdenv.GetCidEncoder(req)
 		if err != nil {
 			return err
 		}
@@ -225,7 +240,7 @@ only for backward compatibility when a legacy CIDv0 is required (--format=v0).
 			}
 
 			err = res.Emit(&BlockStat{
-				Key:  p.Path().RootCid().String(),
+				Key:  enc.Encode(p.Path().RootCid()),
 				Size: p.Size(),
 			})
 			if err != nil {
@@ -275,6 +290,11 @@ It takes a list of CIDs to remove from the local datastore..
 			return err
 		}
 
+		enc, err := cmdenv.GetCidEncoder(req)
+		if err != nil {
+			return err
+		}
+
 		force, _ := req.Options[forceOptionName].(bool)
 		quiet, _ := req.Options[blockQuietOptionName].(bool)
 
@@ -293,7 +313,7 @@ It takes a list of CIDs to remove from the local datastore..
 			err = api.Block().Rm(req.Context, rp, options.Block.Force(force))
 			if err != nil {
 				if err := res.Emit(&removedBlock{
-					Hash:  rp.RootCid().String(),
+					Hash:  enc.Encode(rp.RootCid()),
 					Error: err.Error(),
 				}); err != nil {
 					return err
@@ -303,7 +323,7 @@ It takes a list of CIDs to remove from the local datastore..
 
 			if !quiet {
 				err := res.Emit(&removedBlock{
-					Hash: rp.RootCid().String(),
+					Hash: enc.Encode(rp.RootCid()),
 				})
 				if err != nil {
 					return err

@@ -18,17 +18,18 @@ import (
 	"github.com/ipfs/kubo/core/commands/cmdenv"
 	"github.com/ipfs/kubo/repo"
 	"github.com/ipfs/kubo/repo/fsrepo"
+	"github.com/libp2p/go-libp2p/core/peer"
 )
 
 // ConfigUpdateOutput is config profile apply command's output
 type ConfigUpdateOutput struct {
-	OldCfg map[string]interface{}
-	NewCfg map[string]interface{}
+	OldCfg map[string]any
+	NewCfg map[string]any
 }
 
 type ConfigField struct {
 	Key   string
-	Value interface{}
+	Value any
 }
 
 const (
@@ -116,8 +117,37 @@ Set multiple values in the 'Addresses.AppendAnnounce' array:
 
 			value := args[1]
 
+			// Identity.PeerID is derived from Identity.PrivKey; the node
+			// refuses to start when they disagree. Accept only the node's own
+			// PeerID in any standard form (base58 or CIDv1), compare decoded
+			// IDs rather than strings, store the canonical base58 string kubo
+			// writes elsewhere, and point a mismatched value at the supported
+			// way to change the identity.
+			if strings.EqualFold(key, "identity.peerid") {
+				candidate := value
+				if parseJSON, _ := req.Options[configJSONOptionName].(bool); parseJSON {
+					var s string
+					if err := json.Unmarshal([]byte(value), &s); err == nil {
+						candidate = s
+					}
+				}
+				id, err := nodePeerID(r)
+				if err != nil {
+					return err
+				}
+				got, err := peer.Decode(candidate)
+				if err != nil || got != id {
+					return errors.New("cannot set Identity.PeerID to a value that does not match the node's private key; use 'ipfs key rotate' to change the node identity")
+				}
+				output, err = setConfig(r, key, id.String())
+				if err != nil {
+					return err
+				}
+				return cmds.EmitOnce(res, output)
+			}
+
 			if parseJSON, _ := req.Options[configJSONOptionName].(bool); parseJSON {
-				var jsonVal interface{}
+				var jsonVal any
 				if err := json.Unmarshal([]byte(value), &jsonVal); err != nil {
 					err = fmt.Errorf("failed to unmarshal json. %s", err)
 					return err
@@ -199,7 +229,7 @@ var configShowCmd = &cmds.Command{
 NOTE: For security reasons, this command will omit your private key and remote services. If you would like to make a full backup of your config (private key included), you must copy the config file from your repo.
 `,
 	},
-	Type: make(map[string]interface{}),
+	Type: make(map[string]any),
 	Run: func(req *cmds.Request, res cmds.ResponseEmitter, env cmds.Environment) error {
 		cfgRoot, err := cmdenv.GetConfigRoot(env)
 		if err != nil {
@@ -217,7 +247,7 @@ NOTE: For security reasons, this command will omit your private key and remote s
 			return err
 		}
 
-		var cfg map[string]interface{}
+		var cfg map[string]any
 		err = json.Unmarshal(data, &cfg)
 		if err != nil {
 			return err
@@ -262,7 +292,7 @@ NOTE: For security reasons, this command will omit your private key and remote s
 	},
 }
 
-var HumanJSONEncoder = cmds.MakeTypedEncoder(func(req *cmds.Request, w io.Writer, out *map[string]interface{}) error {
+var HumanJSONEncoder = cmds.MakeTypedEncoder(func(req *cmds.Request, w io.Writer, out *map[string]any) error {
 	buf, err := config.HumanOutput(out)
 	if err != nil {
 		return err
@@ -273,35 +303,35 @@ var HumanJSONEncoder = cmds.MakeTypedEncoder(func(req *cmds.Request, w io.Writer
 })
 
 // Scrubs value and returns error if missing
-func scrubValue(m map[string]interface{}, key []string) (map[string]interface{}, error) {
+func scrubValue(m map[string]any, key []string) (map[string]any, error) {
 	return scrubMapInternal(m, key, false)
 }
 
 // Scrubs value and returns no error if missing
-func scrubOptionalValue(m map[string]interface{}, key []string) (map[string]interface{}, error) {
+func scrubOptionalValue(m map[string]any, key []string) (map[string]any, error) {
 	return scrubMapInternal(m, key, true)
 }
 
-func scrubEither(u interface{}, key []string, okIfMissing bool) (interface{}, error) {
-	m, ok := u.(map[string]interface{})
+func scrubEither(u any, key []string, okIfMissing bool) (any, error) {
+	m, ok := u.(map[string]any)
 	if ok {
 		return scrubMapInternal(m, key, okIfMissing)
 	}
 	return scrubValueInternal(m, key, okIfMissing)
 }
 
-func scrubValueInternal(v interface{}, key []string, okIfMissing bool) (interface{}, error) {
+func scrubValueInternal(v any, key []string, okIfMissing bool) (any, error) {
 	if v == nil && !okIfMissing {
 		return nil, errors.New("failed to find specified key")
 	}
 	return nil, nil
 }
 
-func scrubMapInternal(m map[string]interface{}, key []string, okIfMissing bool) (map[string]interface{}, error) {
+func scrubMapInternal(m map[string]any, key []string, okIfMissing bool) (map[string]any, error) {
 	if len(key) == 0 {
-		return make(map[string]interface{}), nil // delete value
+		return make(map[string]any), nil // delete value
 	}
-	n := map[string]interface{}{}
+	n := map[string]any{}
 	for k, v := range m {
 		if key[0] == "*" || strings.EqualFold(key[0], k) {
 			u, err := scrubEither(v, key[1:], okIfMissing)
@@ -350,6 +380,13 @@ var configReplaceCmd = &cmds.Command{
 		ShortDescription: `
 Make sure to back up the config file first if necessary, as this operation
 can't be undone.
+
+The private key cannot be set over the Kubo RPC API. 'ipfs config replace'
+keeps the existing Identity.PrivKey and ignores that field in <file>. It
+then re-derives Identity.PeerID from the stored key, so a different PeerID
+in <file> is overwritten with the one derived from the key on disk.
+
+To change the node's identity, stop the daemon and run 'ipfs key rotate'.
 `,
 	},
 
@@ -463,7 +500,7 @@ func buildProfileHelp() string {
 }
 
 // scrubPrivKey scrubs private key for security reasons.
-func scrubPrivKey(cfg *config.Config) (map[string]interface{}, error) {
+func scrubPrivKey(cfg *config.Config) (map[string]any, error) {
 	cfgMap, err := config.ToMap(cfg)
 	if err != nil {
 		return nil, err
@@ -553,7 +590,7 @@ func getConfigWithAutoExpand(r repo.Repo, key string) (*ConfigField, error) {
 	}, nil
 }
 
-func setConfig(r repo.Repo, key string, value interface{}) (*ConfigField, error) {
+func setConfig(r repo.Repo, key string, value any) (*ConfigField, error) {
 	err := r.SetConfigKey(key, value)
 	if err != nil {
 		return nil, fmt.Errorf("failed to set config value: %s (maybe use --json?)", err)
@@ -584,6 +621,30 @@ func editConfig(filename string) error {
 	return cmd.Run()
 }
 
+// nodePeerID derives the PeerID implied by the private key stored in the repo
+// config. Identity.PeerID must equal this value; the node refuses to start
+// when the two disagree.
+func nodePeerID(r repo.Repo) (peer.ID, error) {
+	keyF, err := getConfig(r, config.PrivKeySelector)
+	if err != nil {
+		return "", errors.New("failed to get PrivKey")
+	}
+	pkstr, ok := keyF.Value.(string)
+	if !ok {
+		return "", errors.New("private key in config was not a string")
+	}
+	ident := config.Identity{PrivKey: pkstr}
+	pk, err := ident.DecodePrivateKey("")
+	if err != nil {
+		return "", fmt.Errorf("failed to decode PrivKey: %w", err)
+	}
+	id, err := peer.IDFromPrivateKey(pk)
+	if err != nil {
+		return "", fmt.Errorf("failed to derive PeerID from PrivKey: %w", err)
+	}
+	return id, nil
+}
+
 func replaceConfig(r repo.Repo, file io.Reader) error {
 	var newCfg config.Config
 	if err := json.NewDecoder(file).Decode(&newCfg); err != nil {
@@ -607,6 +668,11 @@ func replaceConfig(r repo.Repo, file io.Reader) error {
 	}
 
 	newCfg.Identity.PrivKey = pkstr
+	id, err := nodePeerID(r)
+	if err != nil {
+		return err
+	}
+	newCfg.Identity.PeerID = id.String()
 
 	// Handle Pinning.RemoteServices (API.Key of each service is a secret)
 
@@ -646,7 +712,7 @@ func getRemotePinningServices(r repo.Repo) (map[string]config.RemotePinningServi
 	if remoteServicesTag, err := getConfig(r, config.RemoteServicesPath); err == nil {
 		// seems that golang cannot type assert map[string]interface{} to map[string]config.RemotePinningService
 		// so we have to manually copy the data :-|
-		if val, ok := remoteServicesTag.Value.(map[string]interface{}); ok {
+		if val, ok := remoteServicesTag.Value.(map[string]any); ok {
 			jsonString, err := json.Marshal(val)
 			if err != nil {
 				return nil, err

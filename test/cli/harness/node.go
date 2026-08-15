@@ -248,7 +248,7 @@ func (n *Node) Init(ipfsArgs ...string) *Node {
 		// Telemetry disabled by default in tests.
 		cfg.Plugins = config.Plugins{
 			Plugins: map[string]config.Plugin{
-				"telemetry": config.Plugin{
+				"telemetry": {
 					Disabled: true,
 				},
 			},
@@ -303,7 +303,10 @@ func (n *Node) StartDaemonWithAuthorization(secret string, ipfsArgs ...string) *
 func (n *Node) signalAndWait(watch <-chan struct{}, signal os.Signal, t time.Duration) bool {
 	err := n.Daemon.Cmd.Process.Signal(signal)
 	if err != nil {
-		if errors.Is(err, os.ErrProcessDone) {
+		// On Windows, Process.Wait() sets the handle state to "released"
+		// rather than "done", so a subsequent Signal() returns EINVAL
+		// instead of ErrProcessDone. Treat both as "already exited".
+		if errors.Is(err, os.ErrProcessDone) || errors.Is(err, syscall.EINVAL) {
 			log.Debugf("process for node %d has already finished", n.ID)
 			return true
 		}
@@ -475,7 +478,7 @@ func (n *Node) PeerID() peer.ID {
 
 func (n *Node) WaitOnAPI(authorization string) *Node {
 	log.Debugf("waiting on API for node %d", n.ID)
-	for i := 0; i < 50; i++ {
+	for range 50 {
 		if n.checkAPI(authorization) {
 			log.Debugf("daemon API found, daemon stdout: %s", n.Daemon.Stdout.String())
 			return n
@@ -647,7 +650,7 @@ func (n *Node) Peers() []multiaddr.Multiaddr {
 	// Wait for daemon to be ready if it's supposed to be running
 	if n.Daemon != nil && n.Daemon.Cmd != nil && n.Daemon.Cmd.Process != nil {
 		// Give daemon a short time to become ready
-		for i := 0; i < 10; i++ {
+		for range 10 {
 			if n.IsAlive() {
 				break
 			}
@@ -729,4 +732,35 @@ func (n *Node) APIClient() *HTTPClient {
 		Client:  http.DefaultClient,
 		BaseURL: n.APIURL(),
 	}
+}
+
+// DatastoreCount returns the count of entries matching the given prefix.
+// Requires the daemon to be stopped.
+func (n *Node) DatastoreCount(prefix string) int64 {
+	res := n.IPFS("diag", "datastore", "count", prefix)
+	count, _ := strconv.ParseInt(strings.TrimSpace(res.Stdout.String()), 10, 64)
+	return count
+}
+
+// DatastorePut writes a key-value pair to the datastore.
+// Requires the daemon to be stopped.
+func (n *Node) DatastorePut(key, value string) {
+	n.IPFS("diag", "datastore", "put", key, value)
+}
+
+// DatastoreGet retrieves the value at the given key.
+// Requires the daemon to be stopped. Returns nil if key not found.
+func (n *Node) DatastoreGet(key string) []byte {
+	res := n.RunIPFS("diag", "datastore", "get", key)
+	if res.Err != nil {
+		return nil
+	}
+	return res.Stdout.Bytes()
+}
+
+// DatastoreHasKey checks if a key exists in the datastore.
+// Requires the daemon to be stopped.
+func (n *Node) DatastoreHasKey(key string) bool {
+	res := n.RunIPFS("diag", "datastore", "get", key)
+	return res.Err == nil
 }

@@ -7,6 +7,7 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -29,7 +30,33 @@ import (
 
 const testPeerID = "QmTFauExutTsy4XP6JbMFcw2Wa9645HJt2bTqL6qYDCKfe"
 
+// signalFirstRead closes signal the first time the wrapped reader is read from.
+// The gc tests use it to tell when the adder has moved on to a given file.
+type signalFirstRead struct {
+	r      io.Reader
+	once   sync.Once
+	signal chan struct{}
+}
+
+func (s *signalFirstRead) Read(p []byte) (int, error) {
+	s.once.Do(func() { close(s.signal) })
+	return s.r.Read(p)
+}
+
+// waitForGCRequest blocks until a gc is waiting for the pin lock.
+func waitForGCRequest(ctx context.Context, t *testing.T, locker blockstore.GCLocker) {
+	t.Helper()
+	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); {
+		if locker.GCRequested(ctx) {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("timed out waiting for gc to request the pin lock")
+}
+
 func TestAddMultipleGCLive(t *testing.T) {
+	ctx := t.Context()
 	r := &repo.Mock{
 		C: config.Config{
 			Identity: config.Identity{
@@ -38,13 +65,13 @@ func TestAddMultipleGCLive(t *testing.T) {
 		},
 		D: syncds.MutexWrap(datastore.NewMapDatastore()),
 	}
-	node, err := core.NewNode(context.Background(), &core.BuildCfg{Repo: r})
+	node, err := core.NewNode(ctx, &core.BuildCfg{Repo: r})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	out := make(chan interface{}, 10)
-	adder, err := NewAdder(context.Background(), node.Pinning, node.Blockstore, node.DAG)
+	out := make(chan any, 10)
+	adder, err := NewAdder(ctx, node.Pinning, node.Blockstore, node.DAG)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -67,7 +94,7 @@ func TestAddMultipleGCLive(t *testing.T) {
 
 	go func() {
 		defer close(out)
-		_, _ = adder.AddAllAndPin(context.Background(), slf)
+		_, _ = adder.AddAllAndPin(ctx, slf)
 		// Ignore errors for clarity - the real bug would be gc'ing files while adding them, not this resultant error
 	}()
 
@@ -80,8 +107,13 @@ func TestAddMultipleGCLive(t *testing.T) {
 	gc1started := make(chan struct{})
 	go func() {
 		defer close(gc1started)
-		gc1out = gc.GC(context.Background(), node.Blockstore, node.Repo.Datastore(), node.Pinning, nil)
+		gc1out = gc.GC(ctx, node.Blockstore, node.Repo.Datastore(), node.Pinning, nil)
 	}()
+
+	// Wait for the GC goroutine to reach GCLock, where it blocks behind the pin
+	// lock the adder holds. Until it gets there the adder has no reason to pause,
+	// and it would run to the end of the next file before yielding.
+	waitForGCRequest(ctx, t, node.Blockstore)
 
 	// GC shouldn't get the lock until after the file is completely added
 	select {
@@ -119,8 +151,11 @@ func TestAddMultipleGCLive(t *testing.T) {
 	gc2started := make(chan struct{})
 	go func() {
 		defer close(gc2started)
-		gc2out = gc.GC(context.Background(), node.Blockstore, node.Repo.Datastore(), node.Pinning, nil)
+		gc2out = gc.GC(ctx, node.Blockstore, node.Repo.Datastore(), node.Pinning, nil)
 	}()
+
+	// Wait for the GC goroutine to reach GCLock, as above.
+	waitForGCRequest(ctx, t, node.Blockstore)
 
 	select {
 	case <-gc2started:
@@ -155,6 +190,7 @@ func TestAddMultipleGCLive(t *testing.T) {
 }
 
 func TestAddGCLive(t *testing.T) {
+	ctx := t.Context()
 	r := &repo.Mock{
 		C: config.Config{
 			Identity: config.Identity{
@@ -163,13 +199,13 @@ func TestAddGCLive(t *testing.T) {
 		},
 		D: syncds.MutexWrap(datastore.NewMapDatastore()),
 	}
-	node, err := core.NewNode(context.Background(), &core.BuildCfg{Repo: r})
+	node, err := core.NewNode(ctx, &core.BuildCfg{Repo: r})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	out := make(chan interface{})
-	adder, err := NewAdder(context.Background(), node.Pinning, node.Blockstore, node.DAG)
+	out := make(chan any)
+	adder, err := NewAdder(ctx, node.Pinning, node.Blockstore, node.DAG)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -179,7 +215,8 @@ func TestAddGCLive(t *testing.T) {
 
 	// make two files with pipes so we can 'pause' the add for timing of the test
 	piper, pipew := io.Pipe()
-	hangfile := files.NewReaderFile(piper)
+	addingHangfile := make(chan struct{})
+	hangfile := files.NewReaderFile(&signalFirstRead{r: piper, signal: addingHangfile})
 
 	rfd := files.NewBytesFile([]byte("testfileD"))
 
@@ -193,7 +230,7 @@ func TestAddGCLive(t *testing.T) {
 	go func() {
 		defer close(addDone)
 		defer close(out)
-		_, err := adder.AddAllAndPin(context.Background(), slf)
+		_, err := adder.AddAllAndPin(ctx, slf)
 		if err != nil {
 			t.Error(err)
 		}
@@ -207,12 +244,21 @@ func TestAddGCLive(t *testing.T) {
 		t.Fatal("add shouldn't complete yet")
 	}
 
+	// Wait until the add is inside the hanging file. Between two files the adder
+	// hands the pin lock over to a waiting gc, so asking for gc before this point
+	// lets gc start immediately and the assertions below become meaningless.
+	<-addingHangfile
+
 	var gcout <-chan gc.Result
 	gcstarted := make(chan struct{})
 	go func() {
 		defer close(gcstarted)
-		gcout = gc.GC(context.Background(), node.Blockstore, node.Repo.Datastore(), node.Pinning, nil)
+		gcout = gc.GC(ctx, node.Blockstore, node.Repo.Datastore(), node.Pinning, nil)
 	}()
+
+	// Wait for gc to actually queue up behind the pin lock the add holds, so the
+	// add has something to yield to once it finishes the current file.
+	waitForGCRequest(ctx, t, node.Blockstore)
 
 	// gc shouldn't start until we let the add finish its current file.
 	if _, err := pipew.Write([]byte("some data for file b")); err != nil {
@@ -224,8 +270,6 @@ func TestAddGCLive(t *testing.T) {
 		t.Fatal("gc shouldn't have started yet")
 	default:
 	}
-
-	time.Sleep(time.Millisecond * 100) // make sure gc gets to requesting lock
 
 	// finish write and unblock gc
 	pipew.Close()
@@ -255,9 +299,6 @@ func TestAddGCLive(t *testing.T) {
 		last = c
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
-	defer cancel()
-
 	set := cid.NewSet()
 	err = dag.Walk(ctx, dag.GetLinksWithDAG(node.DAG), last, set.Visit)
 	if err != nil {
@@ -286,7 +327,7 @@ func testAddWPosInfo(t *testing.T, rawLeaves bool) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	out := make(chan interface{})
+	out := make(chan any)
 	adder.Out = out
 	adder.Progress = true
 	adder.RawLeaves = rawLeaves
@@ -377,4 +418,4 @@ func (fi *dummyFileInfo) Size() int64        { return fi.size }
 func (fi *dummyFileInfo) Mode() os.FileMode  { return 0 }
 func (fi *dummyFileInfo) ModTime() time.Time { return fi.modTime }
 func (fi *dummyFileInfo) IsDir() bool        { return false }
-func (fi *dummyFileInfo) Sys() interface{}   { return nil }
+func (fi *dummyFileInfo) Sys() any           { return nil }

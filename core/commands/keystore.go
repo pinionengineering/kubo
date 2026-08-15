@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"crypto/ed25519"
 	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/asn1"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -13,6 +15,7 @@ import (
 	"strings"
 	"text/tabwriter"
 
+	"github.com/decred/dcrd/dcrec/secp256k1/v4"
 	keystore "github.com/ipfs/boxo/keystore"
 	cmds "github.com/ipfs/go-ipfs-cmds"
 	oldcmds "github.com/ipfs/kubo/commands"
@@ -38,9 +41,9 @@ publish'.
   > ipfs key gen --type=rsa --size=2048 mykey
   > ipfs name publish --key=mykey QmSomeHash
 
-'ipfs key list' lists the available keys.
+'ipfs key ls' lists the available keys.
 
-  > ipfs key list
+  > ipfs key ls
   self
   mykey
 		`,
@@ -49,7 +52,8 @@ publish'.
 		"gen":    keyGenCmd,
 		"export": keyExportCmd,
 		"import": keyImportCmd,
-		"list":   keyListCmd,
+		"list":   keyListDeprecatedCmd,
+		"ls":     keyListCmd,
 		"rename": keyRenameCmd,
 		"rm":     keyRmCmd,
 		"rotate": keyRotateCmd,
@@ -87,7 +91,7 @@ var keyGenCmd = &cmds.Command{
 		Tagline: "Create a new keypair",
 	},
 	Options: []cmds.Option{
-		cmds.StringOption(keyStoreTypeOptionName, "t", "type of the key to create: rsa, ed25519").WithDefault(keyStoreAlgorithmDefault),
+		cmds.StringOption(keyStoreTypeOptionName, "t", "type of the key to create: rsa, ed25519, secp256k1").WithDefault(keyStoreAlgorithmDefault),
 		cmds.IntOption(keyStoreSizeOptionName, "s", "size of the key to generate"),
 		ke.OptionIPNSBase,
 	},
@@ -221,9 +225,14 @@ elsewhere. For example, using openssl to get a PEM with public key:
 			if ed25519KeyPointer, ok := stdKey.(*ed25519.PrivateKey); ok {
 				stdKey = *ed25519KeyPointer
 			}
-			// This function supports a restricted list of public key algorithms,
-			// but we generate and use only the RSA and ed25519 types that are on that list.
-			formattedKey, err = x509.MarshalPKCS8PrivateKey(stdKey)
+			if secpKey, ok := stdKey.(*crypto.Secp256k1PrivateKey); ok {
+				// crypto/x509 does not support the secp256k1 curve
+				formattedKey, err = marshalSecp256k1PrivateKey(secpKey)
+			} else {
+				// This function supports a restricted list of public key algorithms,
+				// but we generate and use only the RSA and ed25519 types that are on that list.
+				formattedKey, err = x509.MarshalPKCS8PrivateKey(stdKey)
+			}
 			if err != nil {
 				return fmt.Errorf("marshalling key to PKCS8 format: %w", err)
 			}
@@ -268,8 +277,8 @@ elsewhere. For example, using openssl to get a PEM with public key:
 				outPath = filepath.Clean(outPath)
 			}
 
-			// create file
-			file, err := os.Create(outPath)
+			// create file with owner-only permissions to protect private key material
+			file, err := os.OpenFile(outPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
 			if err != nil {
 				return err
 			}
@@ -363,7 +372,7 @@ The PEM format allows for key generation outside of the IPFS node:
 				return fmt.Errorf("expected PRIVATE KEY type in PEM block but got: %s", pemBlock.Type)
 			}
 
-			stdKey, err := x509.ParsePKCS8PrivateKey(pemBlock.Bytes)
+			stdKey, err := parsePKCS8PrivateKey(pemBlock.Bytes)
 			if err != nil {
 				return fmt.Errorf("parsing PKCS8 format: %w", err)
 			}
@@ -399,9 +408,9 @@ The PEM format allows for key generation outside of the IPFS node:
 		allowAnyKeyType, _ := req.Options[keyAllowAnyTypeOptionName].(bool)
 		if !allowAnyKeyType {
 			switch t := sk.(type) {
-			case *crypto.RsaPrivateKey, *crypto.Ed25519PrivateKey:
+			case *crypto.RsaPrivateKey, *crypto.Ed25519PrivateKey, *crypto.Secp256k1PrivateKey:
 			default:
-				return fmt.Errorf("key type %T is not allowed to be imported, only RSA or Ed25519;"+
+				return fmt.Errorf("key type %T is not allowed to be imported, only RSA, Ed25519, or Secp256k1;"+
 					" use flag --%s if you are sure of what you're doing",
 					t, keyAllowAnyTypeOptionName)
 			}
@@ -458,7 +467,7 @@ var keyListCmd = &cmds.Command{
 	Run: func(req *cmds.Request, res cmds.ResponseEmitter, env cmds.Environment) error {
 		keyEnc, err := ke.KeyEncoderFromString(req.Options[ke.OptionIPNSBase.Name()].(string))
 		if err != nil {
-			return err
+			return fmt.Errorf("cannot get key encoder: %w", err)
 		}
 
 		api, err := cmdenv.GetApi(env, req)
@@ -468,7 +477,7 @@ var keyListCmd = &cmds.Command{
 
 		keys, err := api.Key().List(req.Context)
 		if err != nil {
-			return err
+			return fmt.Errorf("listing keys failed: %w", err)
 		}
 
 		list := make([]KeyOutput, 0, len(keys))
@@ -486,6 +495,17 @@ var keyListCmd = &cmds.Command{
 		cmds.Text: keyOutputListEncoders(),
 	},
 	Type: KeyOutputList{},
+}
+
+var keyListDeprecatedCmd = &cmds.Command{
+	Status: cmds.Deprecated,
+	Helptext: cmds.HelpText{
+		Tagline: "Deprecated: use 'ipfs key ls' instead.",
+	},
+	Options:  keyListCmd.Options,
+	Run:      keyListCmd.Run,
+	Encoders: keyListCmd.Encoders,
+	Type:     keyListCmd.Type,
 }
 
 const (
@@ -605,7 +625,7 @@ environment variable:
 	Arguments: []cmds.Argument{},
 	Options: []cmds.Option{
 		cmds.StringOption(oldKeyOptionName, "o", "Keystore name to use for backing up your existing identity"),
-		cmds.StringOption(keyStoreTypeOptionName, "t", "type of the key to create: rsa, ed25519").WithDefault(keyStoreAlgorithmDefault),
+		cmds.StringOption(keyStoreTypeOptionName, "t", "type of the key to create: rsa, ed25519, secp256k1").WithDefault(keyStoreAlgorithmDefault),
 		cmds.IntOption(keyStoreSizeOptionName, "s", "size of the key to generate"),
 	},
 	NoRemote: true,
@@ -773,7 +793,7 @@ the signed payload is always prefixed with "libp2p-key signed message:".
 `,
 	},
 	Options: []cmds.Option{
-		cmds.StringOption("key", "k", "The name of the key to use for signing."),
+		cmds.StringOption("key", "k", "The name of the key to use for verifying."),
 		cmds.StringOption("signature", "s", "Multibase-encoded signature to verify."),
 		ke.OptionIPNSBase,
 	},
@@ -842,4 +862,99 @@ func DaemonNotRunning(req *cmds.Request, env cmds.Environment) error {
 	}
 
 	return nil
+}
+
+// crypto/x509 does not support the secp256k1 curve, so PKCS#8 wrapping
+// (RFC 5208) of the RFC 5915 EC key structure is done manually below.
+var (
+	oidPublicKeyECDSA      = asn1.ObjectIdentifier{1, 2, 840, 10045, 2, 1}
+	oidNamedCurveSecp256k1 = asn1.ObjectIdentifier{1, 3, 132, 0, 10}
+)
+
+type pkcs8Key struct {
+	Version    int
+	Algo       pkix.AlgorithmIdentifier
+	PrivateKey []byte
+}
+
+type ecPrivateKey struct {
+	Version       int
+	PrivateKey    []byte
+	NamedCurveOID asn1.ObjectIdentifier `asn1:"optional,explicit,tag:0"`
+	PublicKey     asn1.BitString        `asn1:"optional,explicit,tag:1"`
+}
+
+func marshalSecp256k1PrivateKey(sk *crypto.Secp256k1PrivateKey) ([]byte, error) {
+	k := (*secp256k1.PrivateKey)(sk)
+	pub := k.PubKey().SerializeUncompressed()
+	// like x509.MarshalPKCS8PrivateKey, the curve OID lives only in the
+	// outer AlgorithmIdentifier and is omitted from the inner EC key
+	ecDER, err := asn1.Marshal(ecPrivateKey{
+		Version:    1,
+		PrivateKey: k.Serialize(),
+		PublicKey:  asn1.BitString{Bytes: pub, BitLength: len(pub) * 8},
+	})
+	if err != nil {
+		return nil, err
+	}
+	params, err := asn1.Marshal(oidNamedCurveSecp256k1)
+	if err != nil {
+		return nil, err
+	}
+	return asn1.Marshal(pkcs8Key{
+		Version: 0,
+		Algo: pkix.AlgorithmIdentifier{
+			Algorithm:  oidPublicKeyECDSA,
+			Parameters: asn1.RawValue{FullBytes: params},
+		},
+		PrivateKey: ecDER,
+	})
+}
+
+// parsePKCS8PrivateKey extends x509.ParsePKCS8PrivateKey with support for
+// secp256k1 keys.
+func parsePKCS8PrivateKey(der []byte) (any, error) {
+	if isSecp256k1PKCS8(der) {
+		return parseSecp256k1PrivateKey(der)
+	}
+	return x509.ParsePKCS8PrivateKey(der)
+}
+
+func isSecp256k1PKCS8(der []byte) bool {
+	var wrapper pkcs8Key
+	if rest, err := asn1.Unmarshal(der, &wrapper); err != nil || len(rest) > 0 {
+		return false
+	}
+	if !wrapper.Algo.Algorithm.Equal(oidPublicKeyECDSA) {
+		return false
+	}
+	var curve asn1.ObjectIdentifier
+	if _, err := asn1.Unmarshal(wrapper.Algo.Parameters.FullBytes, &curve); err != nil {
+		return false
+	}
+	return curve.Equal(oidNamedCurveSecp256k1)
+}
+
+func parseSecp256k1PrivateKey(der []byte) (*secp256k1.PrivateKey, error) {
+	var wrapper pkcs8Key
+	if _, err := asn1.Unmarshal(der, &wrapper); err != nil {
+		return nil, err
+	}
+	var ec ecPrivateKey
+	if _, err := asn1.Unmarshal(wrapper.PrivateKey, &ec); err != nil {
+		return nil, fmt.Errorf("invalid EC private key: %w", err)
+	}
+	if ec.Version != 1 {
+		return nil, fmt.Errorf("unsupported EC private key version %d", ec.Version)
+	}
+	if len(ec.PrivateKey) > 32 {
+		return nil, errors.New("invalid EC private key length")
+	}
+	var buf [32]byte
+	copy(buf[32-len(ec.PrivateKey):], ec.PrivateKey)
+	var scalar secp256k1.ModNScalar
+	if overflow := scalar.SetBytes(&buf); overflow != 0 || scalar.IsZero() {
+		return nil, errors.New("EC private key not in the valid range for secp256k1")
+	}
+	return secp256k1.NewPrivateKey(&scalar), nil
 }

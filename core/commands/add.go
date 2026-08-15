@@ -13,11 +13,13 @@ import (
 	"github.com/ipfs/kubo/core/commands/cmdenv"
 	"github.com/ipfs/kubo/core/commands/cmdutils"
 
-	"github.com/cheggaaa/pb"
+	"github.com/cheggaaa/pb/v3"
 	"github.com/ipfs/boxo/files"
+	uio "github.com/ipfs/boxo/ipld/unixfs/io"
 	mfs "github.com/ipfs/boxo/mfs"
 	"github.com/ipfs/boxo/path"
 	"github.com/ipfs/boxo/verifcid"
+	cid "github.com/ipfs/go-cid"
 	cmds "github.com/ipfs/go-ipfs-cmds"
 	ipld "github.com/ipfs/go-ipld-format"
 	coreiface "github.com/ipfs/kubo/core/coreiface"
@@ -67,11 +69,18 @@ const (
 	mtimeOptionName           = "mtime"
 	mtimeNsecsOptionName      = "mtime-nsecs"
 	fastProvideRootOptionName = "fast-provide-root"
+	fastProvideDAGOptionName  = "fast-provide-dag"
 	fastProvideWaitOptionName = "fast-provide-wait"
+	emptyDirsOptionName       = "empty-dirs"
 )
 
 const (
 	adderOutChanSize = 8
+
+	// pb/v3 template used before the upload total is known: only the
+	// running byte counter and current speed. Swapped for
+	// cmdenv.ProgressBarFullTemplate once size discovery reports.
+	progressBarInitTemplate = `{{counters . }} {{speed . "%s/s" "?/s"}}`
 )
 
 var AddCmd = &cmds.Command{
@@ -80,26 +89,41 @@ var AddCmd = &cmds.Command{
 		ShortDescription: `
 Adds the content of <path> to IPFS. Use -r to add directories (recursively).
 
-FAST PROVIDE OPTIMIZATION:
+CONTENT DISCOVERABILITY:
 
-When you add content to IPFS, the sweep provider queues it for efficient
-DHT provides over time. While this is resource-efficient, other peers won't
-find your content immediately after 'ipfs add' completes.
+How quickly other peers can find your content depends on Provide.Strategy:
 
-To make sharing faster, 'ipfs add' does an immediate provide of the root CID
-to the DHT in addition to the regular queue. This complements the sweep provider:
-fast-provide handles the urgent case (root CIDs that users share and reference),
-while the sweep provider efficiently provides all blocks according to
-Provide.Strategy over time.
+  Provide.Strategy=all (default):
+    Every block is announced to the routing system as it is written to
+    the blockstore. Content is discoverable immediately.
 
-By default, this immediate provide runs in the background without blocking
-the command. If you need certainty that the root CID is discoverable before
-the command returns (e.g., sharing a link immediately), use --fast-provide-wait
-to wait for the provide to complete. Use --fast-provide-root=false to skip
-this optimization.
+  Selective strategies (pinned, mfs, pinned+mfs):
+    Only the root CID is announced immediately after 'ipfs add'.
+    Remaining blocks are announced during the next reprovide cycle
+    (Provide.DHT.Interval, default 22h).
 
-This works best with the sweep provider and accelerated DHT client.
-Automatically skipped when DHT is not available.
+FAST PROVIDE FLAGS:
+
+  --fast-provide-root (default: enabled)
+    Announce the root CID to the routing system immediately after add,
+    in addition to the regular provide queue. Runs in the background
+    without blocking. Set to false to skip extra provides and minimize
+    network overhead when importing a lot of data at once.
+
+  --fast-provide-dag (default: disabled)
+    Walk and provide the full DAG immediately after add, using the
+    active Provide.Strategy to determine scope. Useful with selective
+    strategies when all blocks need to be discoverable right away.
+    No effect with Provide.Strategy=all (blockstore already provides
+    every block on write).
+
+  --fast-provide-wait (default: disabled)
+    Block until the immediate provide completes before returning.
+    Use when you need certainty that content is discoverable before
+    the command returns (e.g., sharing a link immediately after adding).
+
+All fast-provide flags require an active DHT client. Skipped automatically
+when only HTTP delegated routing is configured.
 `,
 		LongDescription: `
 Adds the content of <path> to IPFS. Use -r to add directories.
@@ -147,6 +171,18 @@ to find it in the future:
 See 'ipfs files --help' to learn more about using MFS
 for keeping track of added files and directories.
 
+SYMLINK HANDLING:
+
+By default, symbolic links are preserved as UnixFS symlink nodes that store
+the target path. Use --dereference-symlinks to resolve symlinks to their
+target content instead:
+
+  > ipfs add -r --dereference-symlinks ./mydir
+
+This resolves all symlinks, including CLI arguments and those found inside
+directories. Symlinks to files become regular file content, symlinks to
+directories are traversed and their contents are added.
+
 CHUNKING EXAMPLES:
 
 The chunker option, '-s', specifies the chunking strategy that dictates
@@ -157,6 +193,16 @@ hashes for the same file. The default is a fixed block size of
 Buzhash or Rabin fingerprint chunker for content defined chunking by
 specifying buzhash or rabin-[min]-[avg]-[max] (where min/avg/max refer
 to the desired chunk sizes in bytes), e.g. 'rabin-262144-524288-1048576'.
+
+The maximum accepted value for 'size-N' and rabin 'max' parameter is
+2MiB minus 256 bytes (2096896 bytes). The 256-byte overhead budget is
+reserved for protobuf/UnixFS framing so that serialized blocks stay
+within the 2MiB block size limit from the bitswap spec. The buzhash
+chunker uses a fixed internal maximum of 512KiB and is not affected.
+
+Only the fixed-size chunker ('size-N') guarantees that the same data
+will always produce the same CID. The rabin and buzhash chunkers may
+change their internal parameters in a future release.
 
 The following examples use very small byte sizes to demonstrate the
 properties of the different chunkers on a small file. You'll likely
@@ -200,16 +246,18 @@ https://github.com/ipfs/kubo/blob/master/docs/config.md#import
 	Options: []cmds.Option{
 		// Input Processing
 		cmds.OptionRecursivePath, // a builtin option that allows recursive paths (-r, --recursive)
-		cmds.OptionDerefArgs,     // a builtin option that resolves passed in filesystem links (--dereference-args)
+		cmds.OptionDerefArgs,     // DEPRECATED: use --dereference-symlinks instead
 		cmds.OptionStdinName,     // a builtin option that optionally allows wrapping stdin into a named file
 		cmds.OptionHidden,
 		cmds.OptionIgnore,
 		cmds.OptionIgnoreRules,
+		cmds.BoolOption(emptyDirsOptionName, "E", "Include empty directories in the import.").WithDefault(config.DefaultUnixFSIncludeEmptyDirs),
+		cmds.OptionDerefSymlinks, // resolve symlinks to their target content
 		// Output Control
 		cmds.BoolOption(quietOptionName, "q", "Write minimal output."),
 		cmds.BoolOption(quieterOptionName, "Q", "Write only final hash."),
 		cmds.BoolOption(silentOptionName, "Write no output."),
-		cmds.BoolOption(progressOptionName, "p", "Stream progress data."),
+		cmds.BoolOption(progressOptionName, "p", "Stream progress data. Defaults to true when stderr is a terminal."),
 		// Basic Add Behavior
 		cmds.BoolOption(onlyHashOptionName, "n", "Only chunk and hash - do not write to disk."),
 		cmds.BoolOption(wrapOptionName, "w", "Wrap files with a directory object."),
@@ -227,7 +275,7 @@ https://github.com/ipfs/kubo/blob/master/docs/config.md#import
 		// Advanced UnixFS Limits
 		cmds.IntOption(maxFileLinksOptionName, "Limit the maximum number of links in UnixFS file nodes to this value. WARNING: experimental. Default: Import.UnixFSFileMaxLinks"),
 		cmds.IntOption(maxDirectoryLinksOptionName, "Limit the maximum number of links in UnixFS basic directory nodes to this value. WARNING: experimental, Import.UnixFSHAMTDirectorySizeThreshold is safer. Default: Import.UnixFSDirectoryMaxLinks"),
-		cmds.IntOption(maxHAMTFanoutOptionName, "Limit the maximum number of links of a UnixFS HAMT directory node to this (power of 2, multiple of 8). WARNING: experimental, Import.UnixFSHAMTDirectorySizeThreshold is safer. Default: Import.UnixFSHAMTDirectoryMaxFanout"),
+		cmds.IntOption(maxHAMTFanoutOptionName, "Limit the maximum number of links of a UnixFS HAMT directory node to this (power of 2, between 8 and 1024). WARNING: experimental, Import.UnixFSHAMTDirectorySizeThreshold is safer. Default: Import.UnixFSHAMTDirectoryMaxFanout"),
 		// Experimental Features
 		cmds.BoolOption(inlineOptionName, "Inline small blocks into CIDs. WARNING: experimental"),
 		cmds.IntOption(inlineLimitOptionName, fmt.Sprintf("Maximum block size to inline. Maximum: %d bytes. WARNING: experimental", verifcid.DefaultMaxIdentityDigestSize)).WithDefault(32),
@@ -239,6 +287,7 @@ https://github.com/ipfs/kubo/blob/master/docs/config.md#import
 		cmds.Int64Option(mtimeOptionName, "Custom POSIX modification time to store in created UnixFS entries (seconds before or after the Unix Epoch). WARNING: experimental, forces dag-pb for root block, disables raw-leaves"),
 		cmds.UintOption(mtimeNsecsOptionName, "Custom POSIX modification time (optional time fraction in nanoseconds)"),
 		cmds.BoolOption(fastProvideRootOptionName, "Immediately provide root CID to DHT in addition to regular queue, for faster discovery. Default: Import.FastProvideRoot"),
+		cmds.BoolOption(fastProvideDAGOptionName, "Walk and provide the full DAG according to Provide.Strategy immediately after add. Default: Import.FastProvideDAG"),
 		cmds.BoolOption(fastProvideWaitOptionName, "Block until the immediate provide completes before returning. Default: Import.FastProvideWait"),
 	},
 	PreRun: func(req *cmds.Request, env cmds.Environment) error {
@@ -248,10 +297,10 @@ https://github.com/ipfs/kubo/blob/master/docs/config.md#import
 		silent, _ := req.Options[silentOptionName].(bool)
 
 		if !quiet && !silent {
-			// ipfs cli progress bar defaults to true unless quiet or silent is used
+			// default to showing progress only when stderr is a terminal
 			_, found := req.Options[progressOptionName].(bool)
 			if !found {
-				req.Options[progressOptionName] = true
+				req.Options[progressOptionName] = cmdenv.IsTerminal(os.Stderr)
 			}
 		}
 
@@ -274,7 +323,7 @@ https://github.com/ipfs/kubo/blob/master/docs/config.md#import
 		}
 
 		progress, _ := req.Options[progressOptionName].(bool)
-		trickle, _ := req.Options[trickleOptionName].(bool)
+		trickle, trickleSet := req.Options[trickleOptionName].(bool)
 		wrap, _ := req.Options[wrapOptionName].(bool)
 		onlyHash, _ := req.Options[onlyHashOptionName].(bool)
 		silent, _ := req.Options[silentOptionName].(bool)
@@ -285,6 +334,7 @@ https://github.com/ipfs/kubo/blob/master/docs/config.md#import
 		maxFileLinks, maxFileLinksSet := req.Options[maxFileLinksOptionName].(int)
 		maxDirectoryLinks, maxDirectoryLinksSet := req.Options[maxDirectoryLinksOptionName].(int)
 		maxHAMTFanout, maxHAMTFanoutSet := req.Options[maxHAMTFanoutOptionName].(int)
+		var sizeEstimationMode uio.SizeEstimationMode
 		nocopy, _ := req.Options[noCopyOptionName].(bool)
 		fscache, _ := req.Options[fstoreCacheOptionName].(bool)
 		cidVer, cidVerSet := req.Options[cidVersionOptionName].(int)
@@ -311,7 +361,19 @@ https://github.com/ipfs/kubo/blob/master/docs/config.md#import
 		mtime, _ := req.Options[mtimeOptionName].(int64)
 		mtimeNsecs, _ := req.Options[mtimeNsecsOptionName].(uint)
 		fastProvideRoot, fastProvideRootSet := req.Options[fastProvideRootOptionName].(bool)
+		fastProvideDAG, fastProvideDAGSet := req.Options[fastProvideDAGOptionName].(bool)
 		fastProvideWait, fastProvideWaitSet := req.Options[fastProvideWaitOptionName].(bool)
+		emptyDirs, _ := req.Options[emptyDirsOptionName].(bool)
+
+		// Note: --dereference-args is deprecated but still works for backwards compatibility.
+		// The help text marks it as DEPRECATED. Users should use --dereference-symlinks instead,
+		// which is a superset (resolves both CLI arg symlinks AND nested symlinks in directories).
+
+		// Wire --trickle from config
+		if !trickleSet && !cfg.Import.UnixFSDAGLayout.IsDefault() {
+			layout := cfg.Import.UnixFSDAGLayout.WithDefault(config.DefaultUnixFSDAGLayout)
+			trickle = layout == config.DAGLayoutTrickle
+		}
 
 		if chunker == "" {
 			chunker = cfg.Import.UnixFSChunker.WithDefault(config.DefaultUnixFSChunker)
@@ -348,8 +410,20 @@ https://github.com/ipfs/kubo/blob/master/docs/config.md#import
 			maxHAMTFanout = int(cfg.Import.UnixFSHAMTDirectoryMaxFanout.WithDefault(config.DefaultUnixFSHAMTDirectoryMaxFanout))
 		}
 
+		// SizeEstimationMode is always set from config (no CLI flag)
+		sizeEstimationMode = cfg.Import.HAMTSizeEstimationMode()
+
 		fastProvideRoot = config.ResolveBoolFromConfig(fastProvideRoot, fastProvideRootSet, cfg.Import.FastProvideRoot, config.DefaultFastProvideRoot)
+		fastProvideDAG = config.ResolveBoolFromConfig(fastProvideDAG, fastProvideDAGSet, cfg.Import.FastProvideDAG, config.DefaultFastProvideDAG)
 		fastProvideWait = config.ResolveBoolFromConfig(fastProvideWait, fastProvideWaitSet, cfg.Import.FastProvideWait, config.DefaultFastProvideWait)
+
+		// --only-hash does not store data, so pinning and providing
+		// are meaningless.
+		if onlyHash {
+			dopin = false
+			fastProvideRoot = false
+			fastProvideDAG = false
+		}
 
 		// Storing optional mode or mtime (UnixFS 1.5) requires root block
 		// to always be 'dag-pb' and not 'raw'. Below adjusts raw-leaves setting, if possible.
@@ -409,6 +483,8 @@ https://github.com/ipfs/kubo/blob/master/docs/config.md#import
 
 			options.Unixfs.PreserveMode(preserveMode),
 			options.Unixfs.PreserveMtime(preserveMtime),
+
+			options.Unixfs.IncludeEmptyDirs(emptyDirs),
 		}
 
 		if mode != 0 {
@@ -441,6 +517,9 @@ https://github.com/ipfs/kubo/blob/master/docs/config.md#import
 			opts = append(opts, options.Unixfs.MaxHAMTFanout(maxHAMTFanout))
 		}
 
+		// SizeEstimationMode is always set from config
+		opts = append(opts, options.Unixfs.SizeEstimationMode(sizeEstimationMode))
+
 		if trickle {
 			opts = append(opts, options.Unixfs.Layout(options.TrickleLayout))
 		}
@@ -464,6 +543,19 @@ https://github.com/ipfs/kubo/blob/master/docs/config.md#import
 			go func() {
 				var err error
 				defer close(events)
+
+				// When copying into MFS without pinning, hold the pin lock
+				// across the add so a concurrent `ipfs repo gc` cannot collect
+				// the freshly added blocks before they are linked into the
+				// persisted MFS root below. A pinned add takes the pin lock
+				// internally (a read lock that is not reentrant-safe against a
+				// waiting GC lock), and its content is protected by the pin, so
+				// for it we only lock around the link itself. See
+				// ipfs/kubo#9553 and ipfs/kubo#6113.
+				if toFilesSet && !dopin {
+					defer ipfsNode.Blockstore.PinLock(req.Context).Unlock(req.Context)
+				}
+
 				pathAdded, err := api.Unixfs().Add(req.Context, addit.Node(), opts...)
 				if err != nil {
 					errCh <- err
@@ -475,6 +567,12 @@ https://github.com/ipfs/kubo/blob/master/docs/config.md#import
 
 				// creating MFS pointers when optional --to-files is set
 				if toFilesSet {
+					// The link creates new MFS directory nodes that are not
+					// pinned, so guard it against a concurrent GC. For an
+					// unpinned add the lock is already held above.
+					if dopin {
+						defer ipfsNode.Blockstore.PinLock(req.Context).Unlock(req.Context)
+					}
 					if addit.Name() == "" {
 						errCh <- fmt.Errorf("%s: cannot add unnamed files to MFS", toFilesOptionName)
 						return
@@ -596,20 +694,34 @@ https://github.com/ipfs/kubo/blob/master/docs/config.md#import
 			return fmt.Errorf("expected a file argument")
 		}
 
-		// Apply fast-provide-root if the flag is enabled
-		if fastProvideRoot && (lastRootCid != path.ImmutablePath{}) {
+		hasRoot := lastRootCid != path.ImmutablePath{}
+
+		if fastProvideDAG && hasRoot {
+			// DAG walk includes the root CID (DFS pre-order emits it
+			// first), so a separate root provide is not needed.
+			cmdenv.ExecuteFastProvideDAG(
+				req.Context,
+				ipfsNode.Context(),
+				[]cid.Cid{lastRootCid.RootCid()},
+				ipfsNode.ProvidingStrategy,
+				ipfsNode.Blockstore,
+				ipfsNode.Provider,
+				fastProvideWait,
+				uint(cfg.Provide.BloomFPRate.WithDefault(config.DefaultProvideBloomFPRate)),
+				0, // block count unknown here; bloom chain auto-grows
+			)
+		} else if fastProvideRoot && hasRoot {
 			cfg, err := ipfsNode.Repo.Config()
 			if err != nil {
 				return err
 			}
-			if err := cmdenv.ExecuteFastProvide(req.Context, ipfsNode, cfg, lastRootCid.RootCid(), fastProvideWait, dopin, dopin, toFilesSet); err != nil {
+			if err := cmdenv.ExecuteFastProvideRoot(req.Context, ipfsNode, cfg, lastRootCid.RootCid(), fastProvideWait, dopin, dopin, toFilesSet); err != nil {
 				return err
 			}
-		} else if !fastProvideRoot {
+		} else if !fastProvideRoot && !fastProvideDAG {
+			log.Debugw("fast-provide-root: skipped", "reason", "disabled by flag or config")
 			if fastProvideWait {
-				log.Debugw("fast-provide-root: skipped", "reason", "disabled by flag or config", "wait-flag-ignored", true)
-			} else {
-				log.Debugw("fast-provide-root: skipped", "reason", "disabled by flag or config")
+				log.Debugw("fast-provide-root: wait-flag-ignored")
 			}
 		}
 
@@ -644,11 +756,8 @@ https://github.com/ipfs/kubo/blob/master/docs/config.md#import
 
 				var bar *pb.ProgressBar
 				if progress {
-					bar = pb.New64(0).SetUnits(pb.U_BYTES)
-					bar.ManualUpdate = true
-					bar.ShowTimeLeft = false
-					bar.ShowPercent = false
-					bar.Output = os.Stderr
+					bar = pb.New64(0).Set(pb.Bytes, true).Set(pb.Static, true).SetWriter(os.Stderr)
+					bar.SetTemplateString(progressBarInitTemplate)
 					bar.Start()
 				}
 
@@ -698,18 +807,17 @@ https://github.com/ipfs/kubo/blob/master/docs/config.md#import
 							}
 							lastBytes = output.Bytes
 							delta := prevFiles + lastBytes - totalProgress
-							totalProgress = bar.Add64(delta)
+							bar.Add64(delta)
+							totalProgress = bar.Current()
 						}
 
 						if progress {
-							bar.Update()
+							bar.Write()
 						}
 					case size := <-sizeChan:
 						if progress {
-							bar.Total = size
-							bar.ShowPercent = true
-							bar.ShowBar = true
-							bar.ShowTimeLeft = true
+							bar.SetTotal(size)
+							bar.SetTemplateString(cmdenv.ProgressBarFullTemplate)
 						}
 					case <-req.Context.Done():
 						// don't set or print error here, that happens in the goroutine below
@@ -717,12 +825,19 @@ https://github.com/ipfs/kubo/blob/master/docs/config.md#import
 					}
 				}
 
-				if progress && bar.Total == 0 && bar.Get() != 0 {
-					bar.Total = bar.Get()
-					bar.ShowPercent = true
-					bar.ShowBar = true
-					bar.ShowTimeLeft = true
-					bar.Update()
+				if progress {
+					// If size discovery never reported, treat the
+					// observed bytes as the total so the final frame
+					// renders the bar and percent.
+					if bar.Total() == 0 && bar.Current() != 0 {
+						bar.SetTotal(bar.Current())
+						bar.SetTemplateString(cmdenv.ProgressBarFullTemplate)
+					}
+					// Finish first so the speed element switches to
+					// the absolute-rate branch (total/elapsed) when
+					// EWMA never accumulated a sample on fast adds.
+					bar.Finish()
+					bar.Write()
 				}
 			}
 

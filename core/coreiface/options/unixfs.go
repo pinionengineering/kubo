@@ -24,16 +24,18 @@ type UnixfsAddSettings struct {
 	CidVersion int
 	MhType     uint64
 
-	Inline               bool
-	InlineLimit          int
-	RawLeaves            bool
-	RawLeavesSet         bool
-	MaxFileLinks         int
-	MaxFileLinksSet      bool
-	MaxDirectoryLinks    int
-	MaxDirectoryLinksSet bool
-	MaxHAMTFanout        int
-	MaxHAMTFanoutSet     bool
+	Inline                bool
+	InlineLimit           int
+	RawLeaves             bool
+	RawLeavesSet          bool
+	MaxFileLinks          int
+	MaxFileLinksSet       bool
+	MaxDirectoryLinks     int
+	MaxDirectoryLinksSet  bool
+	MaxHAMTFanout         int
+	MaxHAMTFanoutSet      bool
+	SizeEstimationMode    *io.SizeEstimationMode
+	SizeEstimationModeSet bool
 
 	Chunker string
 	Layout  Layout
@@ -44,14 +46,16 @@ type UnixfsAddSettings struct {
 	FsCache  bool
 	NoCopy   bool
 
-	Events   chan<- interface{}
+	Events   chan<- any
 	Silent   bool
 	Progress bool
 
-	PreserveMode  bool
-	PreserveMtime bool
-	Mode          os.FileMode
-	Mtime         time.Time
+	PreserveMode        bool
+	PreserveMtime       bool
+	Mode                os.FileMode
+	Mtime               time.Time
+	IncludeEmptyDirs    bool
+	IncludeEmptyDirsSet bool
 }
 
 type UnixfsLsSettings struct {
@@ -93,10 +97,12 @@ func UnixfsAddOptions(opts ...UnixfsAddOption) (*UnixfsAddSettings, cid.Prefix, 
 		Silent:   false,
 		Progress: false,
 
-		PreserveMode:  false,
-		PreserveMtime: false,
-		Mode:          0,
-		Mtime:         time.Time{},
+		PreserveMode:        false,
+		PreserveMtime:       false,
+		Mode:                0,
+		Mtime:               time.Time{},
+		IncludeEmptyDirs:    true, // default: include empty directories
+		IncludeEmptyDirsSet: false,
 	}
 
 	for _, opt := range opts {
@@ -227,10 +233,24 @@ func (unixfsOpts) MaxDirectoryLinks(n int) UnixfsAddOption {
 }
 
 // MaxHAMTFanout specifies the maximum width of the HAMT directory shards.
+// Per the UnixFS spec, the value must be a power of 2, minimum 8
+// (for byte-aligned bitfields), and maximum 1024.
 func (unixfsOpts) MaxHAMTFanout(n int) UnixfsAddOption {
 	return func(settings *UnixfsAddSettings) error {
+		if n < 8 || n&(n-1) != 0 || n > 1024 {
+			return fmt.Errorf("HAMT fanout must be a power of 2, between 8 and 1024 (got %d)", n)
+		}
 		settings.MaxHAMTFanout = n
 		settings.MaxHAMTFanoutSet = true
+		return nil
+	}
+}
+
+// SizeEstimationMode specifies how directory size is estimated for HAMT sharding decisions.
+func (unixfsOpts) SizeEstimationMode(mode io.SizeEstimationMode) UnixfsAddOption {
+	return func(settings *UnixfsAddSettings) error {
+		settings.SizeEstimationMode = &mode
+		settings.SizeEstimationModeSet = true
 		return nil
 	}
 }
@@ -305,7 +325,7 @@ func (unixfsOpts) HashOnly(hashOnly bool) UnixfsAddOption {
 // Add operation.
 //
 // Note that if this channel blocks it may slowdown the adder
-func (unixfsOpts) Events(sink chan<- interface{}) UnixfsAddOption {
+func (unixfsOpts) Events(sink chan<- any) UnixfsAddOption {
 	return func(settings *UnixfsAddSettings) error {
 		settings.Events = sink
 		return nil
@@ -393,6 +413,15 @@ func (unixfsOpts) Mtime(seconds int64, nsecs uint32) UnixfsAddOption {
 			return errors.New("mtime nanoseconds must be in range [1, 999999999]")
 		}
 		settings.Mtime = time.Unix(seconds, int64(nsecs))
+		return nil
+	}
+}
+
+// IncludeEmptyDirs tells the adder to include empty directories in the DAG
+func (unixfsOpts) IncludeEmptyDirs(include bool) UnixfsAddOption {
+	return func(settings *UnixfsAddSettings) error {
+		settings.IncludeEmptyDirs = include
+		settings.IncludeEmptyDirsSet = true
 		return nil
 	}
 }

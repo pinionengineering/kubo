@@ -2,12 +2,17 @@ package config
 
 import (
 	"fmt"
+	"io"
 	"strconv"
 	"strings"
 
+	chunk "github.com/ipfs/boxo/chunker"
+	merkledag "github.com/ipfs/boxo/ipld/merkledag"
 	"github.com/ipfs/boxo/ipld/unixfs/importer/helpers"
-	"github.com/ipfs/boxo/ipld/unixfs/io"
+	uio "github.com/ipfs/boxo/ipld/unixfs/io"
+	"github.com/ipfs/boxo/mfs"
 	"github.com/ipfs/boxo/verifcid"
+	cid "github.com/ipfs/go-cid"
 	mh "github.com/multiformats/go-multihash"
 )
 
@@ -18,6 +23,7 @@ const (
 	DefaultHashFunction    = "sha2-256"
 	DefaultFastProvideRoot = true
 	DefaultFastProvideWait = false
+	DefaultFastProvideDAG  = false
 
 	DefaultUnixFSHAMTDirectorySizeThreshold = 262144 // 256KiB - https://github.com/ipfs/boxo/blob/6c5a07602aed248acc86598f30ab61923a54a83e/ipld/unixfs/io/directory.go#L26
 
@@ -29,29 +35,45 @@ const (
 	// write-batch. The total size of the batch is limited by
 	// BatchMaxnodes and BatchMaxSize.
 	DefaultBatchMaxSize = 100 << 20 // 20MiB
+
+	// HAMTSizeEstimation values for Import.UnixFSHAMTDirectorySizeEstimation
+	HAMTSizeEstimationLinks    = "links"    // legacy: estimate using link names + CID byte lengths (default)
+	HAMTSizeEstimationBlock    = "block"    // full serialized dag-pb block size
+	HAMTSizeEstimationDisabled = "disabled" // disable HAMT sharding entirely
+
+	// DAGLayout values for Import.UnixFSDAGLayout
+	DAGLayoutBalanced = "balanced" // balanced DAG layout (default)
+	DAGLayoutTrickle  = "trickle"  // trickle DAG layout
+
+	DefaultUnixFSHAMTDirectorySizeEstimation = HAMTSizeEstimationLinks // legacy behavior
+	DefaultUnixFSDAGLayout                   = DAGLayoutBalanced       // balanced DAG layout
+	DefaultUnixFSIncludeEmptyDirs            = true                    // include empty directories
 )
 
 var (
 	DefaultUnixFSFileMaxLinks           = int64(helpers.DefaultLinksPerBlock)
 	DefaultUnixFSDirectoryMaxLinks      = int64(0)
-	DefaultUnixFSHAMTDirectoryMaxFanout = int64(io.DefaultShardWidth)
+	DefaultUnixFSHAMTDirectoryMaxFanout = int64(uio.DefaultShardWidth)
 )
 
 // Import configures the default options for ingesting data. This affects commands
 // that ingest data, such as 'ipfs add', 'ipfs dag put, 'ipfs block put', 'ipfs files write'.
 type Import struct {
-	CidVersion                       OptionalInteger
-	UnixFSRawLeaves                  Flag
-	UnixFSChunker                    OptionalString
-	HashFunction                     OptionalString
-	UnixFSFileMaxLinks               OptionalInteger
-	UnixFSDirectoryMaxLinks          OptionalInteger
-	UnixFSHAMTDirectoryMaxFanout     OptionalInteger
-	UnixFSHAMTDirectorySizeThreshold OptionalBytes
-	BatchMaxNodes                    OptionalInteger
-	BatchMaxSize                     OptionalInteger
-	FastProvideRoot                  Flag
-	FastProvideWait                  Flag
+	CidVersion                        OptionalInteger
+	UnixFSRawLeaves                   Flag
+	UnixFSChunker                     OptionalString
+	HashFunction                      OptionalString
+	UnixFSFileMaxLinks                OptionalInteger
+	UnixFSDirectoryMaxLinks           OptionalInteger
+	UnixFSHAMTDirectoryMaxFanout      OptionalInteger
+	UnixFSHAMTDirectorySizeThreshold  OptionalBytes
+	UnixFSHAMTDirectorySizeEstimation OptionalString // "links", "block", or "disabled"
+	UnixFSDAGLayout                   OptionalString // "balanced" or "trickle"
+	BatchMaxNodes                     OptionalInteger
+	BatchMaxSize                      OptionalInteger
+	FastProvideRoot                   Flag
+	FastProvideDAG                    Flag
+	FastProvideWait                   Flag
 }
 
 // ValidateImportConfig validates the Import configuration according to UnixFS spec requirements.
@@ -85,10 +107,9 @@ func ValidateImportConfig(cfg *Import) error {
 	if !cfg.UnixFSHAMTDirectoryMaxFanout.IsDefault() {
 		fanout := cfg.UnixFSHAMTDirectoryMaxFanout.WithDefault(DefaultUnixFSHAMTDirectoryMaxFanout)
 
-		// Check all requirements: fanout < 8 covers both non-positive and non-multiple of 8
-		// Combined with power of 2 check and max limit, this ensures valid values: 8, 16, 32, 64, 128, 256, 512, 1024
+		// Valid values are powers of 2 between 8 and 1024: 8, 16, 32, 64, 128, 256, 512, 1024
 		if fanout < 8 || !isPowerOfTwo(fanout) || fanout > 1024 {
-			return fmt.Errorf("Import.UnixFSHAMTDirectoryMaxFanout must be a positive power of 2, multiple of 8, and not exceed 1024 (got %d)", fanout)
+			return fmt.Errorf("Import.UnixFSHAMTDirectoryMaxFanout must be a power of 2, between 8 and 1024 (got %d)", fanout)
 		}
 	}
 
@@ -129,6 +150,30 @@ func ValidateImportConfig(cfg *Import) error {
 		}
 	}
 
+	// Validate UnixFSHAMTDirectorySizeEstimation
+	if !cfg.UnixFSHAMTDirectorySizeEstimation.IsDefault() {
+		est := cfg.UnixFSHAMTDirectorySizeEstimation.WithDefault(DefaultUnixFSHAMTDirectorySizeEstimation)
+		switch est {
+		case HAMTSizeEstimationLinks, HAMTSizeEstimationBlock, HAMTSizeEstimationDisabled:
+			// valid
+		default:
+			return fmt.Errorf("Import.UnixFSHAMTDirectorySizeEstimation must be %q, %q, or %q, got %q",
+				HAMTSizeEstimationLinks, HAMTSizeEstimationBlock, HAMTSizeEstimationDisabled, est)
+		}
+	}
+
+	// Validate UnixFSDAGLayout
+	if !cfg.UnixFSDAGLayout.IsDefault() {
+		layout := cfg.UnixFSDAGLayout.WithDefault(DefaultUnixFSDAGLayout)
+		switch layout {
+		case DAGLayoutBalanced, DAGLayoutTrickle:
+			// valid
+		default:
+			return fmt.Errorf("Import.UnixFSDAGLayout must be %q or %q, got %q",
+				DAGLayoutBalanced, DAGLayoutTrickle, layout)
+		}
+	}
+
 	return nil
 }
 
@@ -144,8 +189,7 @@ func isValidChunker(chunker string) bool {
 	}
 
 	// Check for size-<bytes> format
-	if strings.HasPrefix(chunker, "size-") {
-		sizeStr := strings.TrimPrefix(chunker, "size-")
+	if sizeStr, ok := strings.CutPrefix(chunker, "size-"); ok {
 		if sizeStr == "" {
 			return false
 		}
@@ -167,7 +211,7 @@ func isValidChunker(chunker string) bool {
 
 		// Parse and validate min, avg, max values
 		values := make([]int, 3)
-		for i := 0; i < 3; i++ {
+		for i := range 3 {
 			val, err := strconv.Atoi(parts[i+1])
 			if err != nil {
 				return false
@@ -181,4 +225,91 @@ func isValidChunker(chunker string) bool {
 	}
 
 	return false
+}
+
+// HAMTSizeEstimationMode returns the boxo SizeEstimationMode based on the config value.
+func (i *Import) HAMTSizeEstimationMode() uio.SizeEstimationMode {
+	switch i.UnixFSHAMTDirectorySizeEstimation.WithDefault(DefaultUnixFSHAMTDirectorySizeEstimation) {
+	case HAMTSizeEstimationLinks:
+		return uio.SizeEstimationLinks
+	case HAMTSizeEstimationBlock:
+		return uio.SizeEstimationBlock
+	case HAMTSizeEstimationDisabled:
+		return uio.SizeEstimationDisabled
+	default:
+		return uio.SizeEstimationLinks
+	}
+}
+
+// UnixFSSplitterFunc returns a SplitterGen function based on Import.UnixFSChunker.
+// The returned function creates a Splitter for the configured chunking strategy.
+// The chunker string is parsed once when this method is called, not on each use.
+func (i *Import) UnixFSSplitterFunc() chunk.SplitterGen {
+	chunkerStr := i.UnixFSChunker.WithDefault(DefaultUnixFSChunker)
+
+	// Parse size-based chunker (most common case) and return optimized generator
+	if sizeStr, ok := strings.CutPrefix(chunkerStr, "size-"); ok {
+		if size, err := strconv.ParseInt(sizeStr, 10, 64); err == nil && size > 0 {
+			return chunk.SizeSplitterGen(size)
+		}
+	}
+
+	// For other chunker types (rabin, buzhash) or invalid config,
+	// fall back to parsing per-use (these are rare cases)
+	return func(r io.Reader) chunk.Splitter {
+		s, err := chunk.FromString(r, chunkerStr)
+		if err != nil {
+			return chunk.DefaultSplitter(r)
+		}
+		return s
+	}
+}
+
+// MFSRootOptions returns all MFS root options derived from Import config.
+func (i *Import) MFSRootOptions() ([]mfs.Option, error) {
+	cidBuilder, err := i.UnixFSCidBuilder()
+	if err != nil {
+		return nil, err
+	}
+	sizeEstimationMode := i.HAMTSizeEstimationMode()
+	return []mfs.Option{
+		mfs.WithCidBuilder(cidBuilder),
+		mfs.WithChunker(i.UnixFSSplitterFunc()),
+		mfs.WithMaxLinks(int(i.UnixFSDirectoryMaxLinks.WithDefault(DefaultUnixFSDirectoryMaxLinks))),
+		mfs.WithMaxHAMTFanout(int(i.UnixFSHAMTDirectoryMaxFanout.WithDefault(DefaultUnixFSHAMTDirectoryMaxFanout))),
+		mfs.WithHAMTShardingSize(int(i.UnixFSHAMTDirectorySizeThreshold.WithDefault(DefaultUnixFSHAMTDirectorySizeThreshold))),
+		mfs.WithSizeEstimationMode(sizeEstimationMode),
+		// Bound under-lock DAG reads so a locally-missing directory node fails
+		// after the timeout instead of blocking forever on the network and
+		// wedging MFS (ipfs/kubo#7008, #7844, #10842). Reads stay online, so
+		// lazily-referenced remote content is still fetched.
+		mfs.WithFetchTimeout(DefaultMFSFetchTimeout),
+	}, nil
+}
+
+// UnixFSCidBuilder returns a cid.Builder based on Import.CidVersion and
+// Import.HashFunction. Always builds an explicit prefix so that MFS
+// respects kubo defaults even when they differ from boxo's internal
+// CIDv0/sha2-256 default (see https://github.com/ipfs/kubo/issues/4143).
+func (i *Import) UnixFSCidBuilder() (cid.Builder, error) {
+	cidVer := int(i.CidVersion.WithDefault(DefaultCidVersion))
+	hashFunc := i.HashFunction.WithDefault(DefaultHashFunction)
+
+	if hashFunc != DefaultHashFunction && cidVer == 0 {
+		cidVer = 1
+	}
+
+	prefix, err := merkledag.PrefixForCidVersion(cidVer)
+	if err != nil {
+		return nil, err
+	}
+
+	hashCode, ok := mh.Names[strings.ToLower(hashFunc)]
+	if !ok {
+		return nil, fmt.Errorf("Import.HashFunction unrecognized: %q", hashFunc)
+	}
+	prefix.MhType = hashCode
+	prefix.MhLength = -1
+
+	return &prefix, nil
 }

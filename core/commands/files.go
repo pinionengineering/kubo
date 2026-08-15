@@ -16,11 +16,16 @@ import (
 	"time"
 
 	humanize "github.com/dustin/go-humanize"
+	oldcmds "github.com/ipfs/kubo/commands"
 	"github.com/ipfs/kubo/config"
 	"github.com/ipfs/kubo/core"
 	"github.com/ipfs/kubo/core/commands/cmdenv"
+	"github.com/ipfs/kubo/core/commands/cmdutils"
+	"github.com/ipfs/kubo/core/node"
+	fsrepo "github.com/ipfs/kubo/repo/fsrepo"
 
 	bservice "github.com/ipfs/boxo/blockservice"
+	bstore "github.com/ipfs/boxo/blockstore"
 	offline "github.com/ipfs/boxo/exchange/offline"
 	dag "github.com/ipfs/boxo/ipld/merkledag"
 	ft "github.com/ipfs/boxo/ipld/unixfs"
@@ -28,6 +33,7 @@ import (
 	"github.com/ipfs/boxo/path"
 	cid "github.com/ipfs/go-cid"
 	cidenc "github.com/ipfs/go-cidutil/cidenc"
+	"github.com/ipfs/go-datastore"
 	cmds "github.com/ipfs/go-ipfs-cmds"
 	ipld "github.com/ipfs/go-ipld-format"
 	logging "github.com/ipfs/go-log/v2"
@@ -72,6 +78,16 @@ func updateNoFlushCounter(nd *core.IpfsNode, flush bool) error {
 
 	noFlushOperationCounter.Add(1)
 	return nil
+}
+
+// mfsPinLock takes the pin lock, a shared read-lock on the blockstore GC
+// locker. A concurrent "ipfs repo gc" holds the exclusive GC lock, so while
+// this lock is held GC cannot run, and GC waits for it to be released. Hold it
+// across a whole MFS mutation (including its flush) so GC cannot collect blocks
+// the mutation has written to the blockstore before they are linked into the
+// persisted MFS root. This mirrors how "ipfs add" guards its writes.
+func mfsPinLock(nd *core.IpfsNode, ctx context.Context) bstore.Unlocker {
+	return nd.Blockstore.PinLock(ctx)
 }
 
 // FilesCmd is the 'ipfs files' command
@@ -120,18 +136,19 @@ performance.`,
 		cmds.BoolOption(filesFlushOptionName, "f", "Flush target and ancestors after write.").WithDefault(true),
 	},
 	Subcommands: map[string]*cmds.Command{
-		"read":  filesReadCmd,
-		"write": filesWriteCmd,
-		"mv":    filesMvCmd,
-		"cp":    filesCpCmd,
-		"ls":    filesLsCmd,
-		"mkdir": filesMkdirCmd,
-		"stat":  filesStatCmd,
-		"rm":    filesRmCmd,
-		"flush": filesFlushCmd,
-		"chcid": filesChcidCmd,
-		"chmod": filesChmodCmd,
-		"touch": filesTouchCmd,
+		"read":   filesReadCmd,
+		"write":  filesWriteCmd,
+		"mv":     filesMvCmd,
+		"cp":     filesCpCmd,
+		"ls":     filesLsCmd,
+		"mkdir":  filesMkdirCmd,
+		"stat":   filesStatCmd,
+		"rm":     filesRmCmd,
+		"flush":  filesFlushCmd,
+		"chcid":  filesChcidCmd,
+		"chmod":  filesChmodCmd,
+		"chroot": filesChrootCmd,
+		"touch":  filesTouchCmd,
 	},
 }
 
@@ -241,7 +258,7 @@ var filesStatCmd = &cmds.Command{
 			return err
 		}
 
-		path, err := checkPath(req.Arguments[0])
+		path, err := checkContentOrMfsPath(req.Arguments[0])
 		if err != nil {
 			return err
 		}
@@ -492,8 +509,14 @@ being GC'ed.
 		if err != nil {
 			return err
 		}
+		defer mfsPinLock(nd, req.Context).Unlock(req.Context)
 
-		prefix, err := getPrefixNew(req)
+		cfg, err := nd.Repo.Config()
+		if err != nil {
+			return err
+		}
+
+		prefix, err := getPrefix(req, &cfg.Import)
 		if err != nil {
 			return err
 		}
@@ -503,7 +526,7 @@ being GC'ed.
 			return err
 		}
 
-		src, err := checkPath(req.Arguments[0])
+		src, err := checkContentOrMfsPath(req.Arguments[0])
 		if err != nil {
 			return err
 		}
@@ -544,7 +567,13 @@ being GC'ed.
 
 		mkParents, _ := req.Options[filesParentsOptionName].(bool)
 		if mkParents {
-			err := ensureContainingDirectoryExists(nd.FilesRoot, dst, prefix)
+			maxDirLinks := int(cfg.Import.UnixFSDirectoryMaxLinks.WithDefault(config.DefaultUnixFSDirectoryMaxLinks))
+			sizeEstimationMode := cfg.Import.HAMTSizeEstimationMode()
+			err := ensureContainingDirectoryExists(nd.FilesRoot, dst,
+				mfs.WithCidBuilder(prefix),
+				mfs.WithMaxLinks(maxDirLinks),
+				mfs.WithSizeEstimationMode(sizeEstimationMode),
+			)
 			if err != nil {
 				return err
 			}
@@ -583,22 +612,28 @@ being GC'ed.
 }
 
 func getNodeFromPath(ctx context.Context, node *core.IpfsNode, api iface.CoreAPI, p string) (ipld.Node, error) {
-	switch {
-	case strings.HasPrefix(p, "/ipfs/"):
-		pth, err := path.NewPath(p)
-		if err != nil {
-			return nil, err
-		}
-
+	// A content path or native IPFS URI (/ipfs/cid, ipfs://cid, /ipns/name, ...)
+	// is resolved through the DAG. Anything else is treated as an MFS path.
+	if pth, err := path.NewPathFromURI(p); err == nil {
 		return api.ResolveNode(ctx, pth)
-	default:
-		fsn, err := mfs.Lookup(node.FilesRoot, p)
-		if err != nil {
-			return nil, err
-		}
-
-		return fsn.GetNode()
 	}
+
+	fsn, err := mfs.Lookup(node.FilesRoot, p)
+	if err != nil {
+		return nil, err
+	}
+
+	return fsn.GetNode()
+}
+
+// checkContentOrMfsPath validates an argument that may be an MFS path, a content
+// path (/ipfs/cid), or a native IPFS URI (ipfs://cid). A URI is rewritten to its
+// canonical content-path form; anything else is validated as an MFS path.
+func checkContentOrMfsPath(arg string) (string, error) {
+	if p, err := path.NewPathFromURI(arg); err == nil {
+		return p.String(), nil
+	}
+	return checkPath(arg)
 }
 
 func unlinkNodeIfExists(node *core.IpfsNode, path string) error {
@@ -816,7 +851,7 @@ Examples:
 			return fmt.Errorf("%s was not a file", path)
 		}
 
-		rfd, err := fi.Open(mfs.Flags{Read: true})
+		rfd, err := fi.Open(req.Context, mfs.Flags{Read: true})
 		if err != nil {
 			return err
 		}
@@ -889,6 +924,7 @@ Example:
 		if err != nil {
 			return err
 		}
+		defer mfsPinLock(nd, req.Context).Unlock(req.Context)
 
 		flush, _ := req.Options[filesFlushOptionName].(bool)
 
@@ -983,8 +1019,12 @@ stat' on the file or any of its ancestors.
 WARNING:
 
 The CID produced by 'files write' will be different from 'ipfs add' because
-'ipfs file write' creates a trickle-dag optimized for append-only operations
+'ipfs files write' creates a trickle-dag optimized for append-only operations.
 See '--trickle' in 'ipfs add --help' for more information.
+
+NOTE: The 'Import.UnixFSFileMaxLinks' config option does not apply to this command.
+Trickle DAG has a fixed internal structure optimized for append operations.
+To use configurable max-links, use 'ipfs add' with balanced DAG layout.
 
 If you want to add a file without modifying an existing one,
 use 'ipfs add' with '--to-files':
@@ -1021,6 +1061,7 @@ See '--to-files' in 'ipfs add --help' for more information.
 		if err != nil {
 			return err
 		}
+		defer mfsPinLock(nd, req.Context).Unlock(req.Context)
 
 		cfg, err := nd.Repo.Config()
 		if err != nil {
@@ -1042,7 +1083,7 @@ See '--to-files' in 'ipfs add --help' for more information.
 			rawLeaves = cfg.Import.UnixFSRawLeaves.WithDefault(config.DefaultUnixFSRawLeaves)
 		}
 
-		prefix, err := getPrefixNew(req)
+		prefix, err := getPrefix(req, &cfg.Import)
 		if err != nil {
 			return err
 		}
@@ -1053,7 +1094,13 @@ See '--to-files' in 'ipfs add --help' for more information.
 		}
 
 		if mkParents {
-			err := ensureContainingDirectoryExists(nd.FilesRoot, path, prefix)
+			maxDirLinks := int(cfg.Import.UnixFSDirectoryMaxLinks.WithDefault(config.DefaultUnixFSDirectoryMaxLinks))
+			sizeEstimationMode := cfg.Import.HAMTSizeEstimationMode()
+			err := ensureContainingDirectoryExists(nd.FilesRoot, path,
+				mfs.WithCidBuilder(prefix),
+				mfs.WithMaxLinks(maxDirLinks),
+				mfs.WithSizeEstimationMode(sizeEstimationMode),
+			)
 			if err != nil {
 				return err
 			}
@@ -1067,7 +1114,7 @@ See '--to-files' in 'ipfs add --help' for more information.
 			fi.RawLeaves = rawLeaves
 		}
 
-		wfd, err := fi.Open(mfs.Flags{Write: true, Sync: flush})
+		wfd, err := fi.Open(req.Context, mfs.Flags{Write: true, Sync: flush})
 		if err != nil {
 			return err
 		}
@@ -1156,6 +1203,12 @@ Examples:
 		if err != nil {
 			return err
 		}
+		defer mfsPinLock(n, req.Context).Unlock(req.Context)
+
+		cfg, err := n.Repo.Config()
+		if err != nil {
+			return err
+		}
 
 		dashp, _ := req.Options[filesParentsOptionName].(bool)
 		dirtomake, err := checkPath(req.Arguments[0])
@@ -1169,17 +1222,20 @@ Examples:
 			return err
 		}
 
-		prefix, err := getPrefix(req)
+		prefix, err := getPrefix(req, &cfg.Import)
 		if err != nil {
 			return err
 		}
 		root := n.FilesRoot
 
-		err = mfs.Mkdir(root, dirtomake, mfs.MkdirOpts{
-			Mkparents:  dashp,
-			Flush:      flush,
-			CidBuilder: prefix,
-		})
+		maxDirLinks := int(cfg.Import.UnixFSDirectoryMaxLinks.WithDefault(config.DefaultUnixFSDirectoryMaxLinks))
+		sizeEstimationMode := cfg.Import.HAMTSizeEstimationMode()
+
+		err = mfs.Mkdir(root, dirtomake, mfs.MkdirOpts{Mkparents: dashp, Flush: flush},
+			mfs.WithCidBuilder(prefix),
+			mfs.WithMaxLinks(maxDirLinks),
+			mfs.WithSizeEstimationMode(sizeEstimationMode),
+		)
 
 		return err
 	},
@@ -1205,6 +1261,7 @@ are run with the '--flush=false'.
 		if err != nil {
 			return err
 		}
+		defer mfsPinLock(nd, req.Context).Unlock(req.Context)
 
 		enc, err := cmdenv.GetCidEncoder(req)
 		if err != nil {
@@ -1234,10 +1291,15 @@ var filesChcidCmd = &cmds.Command{
 		Tagline: "Change the CID version or hash function of the root node of a given path.",
 		ShortDescription: `
 Change the CID version or hash function of the root node of a given path.
+
+Note: the MFS root ('/') CID format is controlled by Import.CidVersion and
+Import.HashFunction in the config and cannot be changed with this command.
+Use 'ipfs config' to modify these values instead. This command only works
+on subdirectories of the MFS root.
 `,
 	},
 	Arguments: []cmds.Argument{
-		cmds.StringArg("path", false, false, "Path to change. Default: '/'."),
+		cmds.StringArg("path", true, false, "Path to change (must not be '/')."),
 	},
 	Options: []cmds.Option{
 		cidVersionOption,
@@ -1248,15 +1310,19 @@ Change the CID version or hash function of the root node of a given path.
 		if err != nil {
 			return err
 		}
+		defer mfsPinLock(nd, req.Context).Unlock(req.Context)
 
-		path := "/"
-		if len(req.Arguments) > 0 {
-			path = req.Arguments[0]
+		path := req.Arguments[0]
+		if path == "/" {
+			return fmt.Errorf("cannot change CID format of the MFS root; " +
+				"use 'ipfs config Import.CidVersion' and 'ipfs config Import.HashFunction' instead")
 		}
 
 		flush, _ := req.Options[filesFlushOptionName].(bool)
 
-		prefix, err := getPrefix(req)
+		// Note: files chcid is for explicitly changing CID format, so we don't
+		// fall back to Import config here. If no options are provided, it does nothing.
+		prefix, err := getPrefix(req, nil)
 		if err != nil {
 			return err
 		}
@@ -1332,6 +1398,7 @@ Remove files or directories.
 		if err != nil {
 			return err
 		}
+		defer mfsPinLock(nd, req.Context).Unlock(req.Context)
 		// if '--force' specified, it will remove anything else,
 		// including file, directory, corrupted node, etc
 		force, _ := req.Options[forceOptionName].(bool)
@@ -1414,75 +1481,48 @@ func removePath(filesRoot *mfs.Root, path string, force bool, dashr bool) error 
 	return pdir.Flush()
 }
 
-func getPrefixNew(req *cmds.Request) (cid.Builder, error) {
+// getPrefix builds a cid.Builder from CLI flags, falling back to importCfg
+// when provided. Returns (nil, nil) when neither CLI nor config set a value.
+func getPrefix(req *cmds.Request, importCfg *config.Import) (cid.Builder, error) {
 	cidVer, cidVerSet := req.Options[filesCidVersionOptionName].(int)
 	hashFunStr, hashFunSet := req.Options[filesHashOptionName].(string)
 
-	if !cidVerSet && !hashFunSet {
-		return nil, nil
-	}
-
-	if hashFunSet && cidVer == 0 {
-		cidVer = 1
-	}
-
-	prefix, err := dag.PrefixForCidVersion(cidVer)
-	if err != nil {
-		return nil, err
-	}
-
-	if hashFunSet {
-		hashFunCode, ok := mh.Names[strings.ToLower(hashFunStr)]
-		if !ok {
-			return nil, fmt.Errorf("unrecognized hash function: %s", strings.ToLower(hashFunStr))
+	if cidVerSet || hashFunSet {
+		// CLI flags take precedence: build prefix from them directly.
+		if hashFunSet && cidVer == 0 {
+			cidVer = 1
 		}
-		prefix.MhType = hashFunCode
-		prefix.MhLength = -1
+		prefix, err := dag.PrefixForCidVersion(cidVer)
+		if err != nil {
+			return nil, err
+		}
+		if hashFunSet {
+			hashFunCode, ok := mh.Names[strings.ToLower(hashFunStr)]
+			if !ok {
+				return nil, fmt.Errorf("unrecognized hash function: %q", hashFunStr)
+			}
+			prefix.MhType = hashFunCode
+			prefix.MhLength = -1
+		}
+		return &prefix, nil
 	}
 
-	return &prefix, nil
+	// No CLI flags: fall back to Import config.
+	if importCfg != nil {
+		return importCfg.UnixFSCidBuilder()
+	}
+
+	return nil, nil
 }
 
-func getPrefix(req *cmds.Request) (cid.Builder, error) {
-	cidVer, cidVerSet := req.Options[filesCidVersionOptionName].(int)
-	hashFunStr, hashFunSet := req.Options[filesHashOptionName].(string)
-
-	if !cidVerSet && !hashFunSet {
-		return nil, nil
-	}
-
-	if hashFunSet && cidVer == 0 {
-		cidVer = 1
-	}
-
-	prefix, err := dag.PrefixForCidVersion(cidVer)
-	if err != nil {
-		return nil, err
-	}
-
-	if hashFunSet {
-		hashFunCode, ok := mh.Names[strings.ToLower(hashFunStr)]
-		if !ok {
-			return nil, fmt.Errorf("unrecognized hash function: %s", strings.ToLower(hashFunStr))
-		}
-		prefix.MhType = hashFunCode
-		prefix.MhLength = -1
-	}
-
-	return &prefix, nil
-}
-
-func ensureContainingDirectoryExists(r *mfs.Root, path string, builder cid.Builder) error {
+func ensureContainingDirectoryExists(r *mfs.Root, path string, opts ...mfs.Option) error {
 	dirtomake := gopath.Dir(path)
 
 	if dirtomake == "/" {
 		return nil
 	}
 
-	return mfs.Mkdir(r, dirtomake, mfs.MkdirOpts{
-		Mkparents:  true,
-		CidBuilder: builder,
-	})
+	return mfs.Mkdir(r, dirtomake, mfs.MkdirOpts{Mkparents: true}, opts...)
 }
 
 func getFileHandle(r *mfs.Root, path string, create bool, builder cid.Builder) (*mfs.File, error) {
@@ -1590,6 +1630,7 @@ The mode argument must be specified in Unix numeric notation.
 		if err != nil {
 			return err
 		}
+		defer mfsPinLock(nd, req.Context).Unlock(req.Context)
 
 		path, err := checkPath(req.Arguments[1])
 		if err != nil {
@@ -1629,6 +1670,7 @@ Examples:
 		if err != nil {
 			return err
 		}
+		defer mfsPinLock(nd, req.Context).Unlock(req.Context)
 
 		path, err := checkPath(req.Arguments[0])
 		if err != nil {
@@ -1646,5 +1688,149 @@ Examples:
 		}
 
 		return mfs.Touch(nd.FilesRoot, path, ts)
+	},
+}
+
+const chrootConfirmOptionName = "confirm"
+
+var filesChrootCmd = &cmds.Command{
+	Status: cmds.Experimental,
+	Helptext: cmds.HelpText{
+		Tagline: "Change the MFS root CID.",
+		ShortDescription: `
+'ipfs files chroot' changes the root CID used by MFS (Mutable File System).
+This is a recovery command for when MFS becomes corrupted and prevents the
+daemon from starting.
+
+When run without a CID argument, resets MFS to an empty directory.
+
+WARNING: The old MFS root and its unpinned children will be removed during
+the next garbage collection. Pin the old root first if you want to preserve.
+
+This command can only run when the daemon is not running.
+
+Examples:
+
+  # Reset MFS to empty directory (recovery from corruption)
+  $ ipfs files chroot --confirm
+
+  # Restore MFS to a known good directory CID
+  $ ipfs files chroot --confirm QmYourBackupCID
+`,
+	},
+	Arguments: []cmds.Argument{
+		cmds.StringArg("cid", false, false, "New root CID (defaults to empty directory if not specified)."),
+	},
+	Options: []cmds.Option{
+		cmds.BoolOption(chrootConfirmOptionName, "Confirm this potentially destructive operation."),
+	},
+	NoRemote: true,
+	Extra:    CreateCmdExtras(SetDoesNotUseRepo(true)),
+	Run: func(req *cmds.Request, res cmds.ResponseEmitter, env cmds.Environment) error {
+		confirm, _ := req.Options[chrootConfirmOptionName].(bool)
+		if !confirm {
+			return errors.New("this is a potentially destructive operation; pass --confirm to proceed")
+		}
+
+		enc, err := cmdenv.GetCidEncoder(req)
+		if err != nil {
+			return err
+		}
+
+		// Determine new root CID
+		var newRootCid cid.Cid
+		if len(req.Arguments) > 0 {
+			var err error
+			newRootCid, err = cmdutils.CidFromArg(req.Arguments[0])
+			if err != nil {
+				return fmt.Errorf("invalid CID %q: %w", req.Arguments[0], err)
+			}
+		} else {
+			// Default to empty directory
+			newRootCid = ft.EmptyDirNode().Cid()
+		}
+
+		// Get config root to open repo directly
+		cctx := env.(*oldcmds.Context)
+		cfgRoot := cctx.ConfigRoot
+
+		// Open repo directly (daemon must not be running)
+		repo, err := fsrepo.Open(cfgRoot)
+		if err != nil {
+			return fmt.Errorf("opening repo (is the daemon running?): %w", err)
+		}
+		defer repo.Close()
+
+		localDS := repo.Datastore()
+		bs := bstore.NewBlockstore(localDS)
+
+		// Check new root exists locally and is a directory
+		hasBlock, err := bs.Has(req.Context, newRootCid)
+		if err != nil {
+			return fmt.Errorf("checking if new root exists: %w", err)
+		}
+		if !hasBlock {
+			// Special case: empty dir is always available (hardcoded in boxo)
+			emptyDirCid := ft.EmptyDirNode().Cid()
+			if !newRootCid.Equals(emptyDirCid) {
+				return fmt.Errorf("new root %s does not exist locally; fetch it first with 'ipfs block get'", enc.Encode(newRootCid))
+			}
+		}
+
+		// Validate it's a directory (not a file)
+		if hasBlock {
+			blk, err := bs.Get(req.Context, newRootCid)
+			if err != nil {
+				return fmt.Errorf("reading new root block: %w", err)
+			}
+			pbNode, err := dag.DecodeProtobuf(blk.RawData())
+			if err != nil {
+				return fmt.Errorf("new root is not a valid dag-pb node: %w", err)
+			}
+			fsNode, err := ft.FSNodeFromBytes(pbNode.Data())
+			if err != nil {
+				return fmt.Errorf("new root is not a valid UnixFS node: %w", err)
+			}
+			if fsNode.Type() != ft.TDirectory && fsNode.Type() != ft.THAMTShard {
+				return fmt.Errorf("new root must be a directory, got %s", fsNode.Type())
+			}
+		}
+
+		// Get old root for display (if exists)
+		var oldRootStr string
+		oldRootBytes, err := localDS.Get(req.Context, node.FilesRootDatastoreKey)
+		if err == nil {
+			oldRootCid, err := cid.Cast(oldRootBytes)
+			if err == nil {
+				oldRootStr = enc.Encode(oldRootCid)
+			}
+		} else if !errors.Is(err, datastore.ErrNotFound) {
+			return fmt.Errorf("reading current MFS root: %w", err)
+		}
+
+		// Write new root
+		err = localDS.Put(req.Context, node.FilesRootDatastoreKey, newRootCid.Bytes())
+		if err != nil {
+			return fmt.Errorf("writing new MFS root: %w", err)
+		}
+
+		// Build output message
+		newRootStr := enc.Encode(newRootCid)
+		var msg string
+		if oldRootStr != "" {
+			msg = fmt.Sprintf("MFS root changed from %s to %s\n", oldRootStr, newRootStr)
+			msg += fmt.Sprintf("The old root %s will be garbage collected unless pinned.\n", oldRootStr)
+		} else {
+			msg = fmt.Sprintf("MFS root set to %s\n", newRootStr)
+		}
+
+		return cmds.EmitOnce(res, &MessageOutput{Message: msg})
+	},
+	Type: MessageOutput{},
+	Encoders: cmds.EncoderMap{
+		cmds.Text: cmds.MakeTypedEncoder(func(req *cmds.Request, w io.Writer, out *MessageOutput) error {
+			_, err := fmt.Fprint(w, out.Message)
+			return err
+		}),
 	},
 }

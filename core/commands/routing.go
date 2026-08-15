@@ -11,11 +11,13 @@ import (
 
 	"github.com/ipfs/kubo/config"
 	cmdenv "github.com/ipfs/kubo/core/commands/cmdenv"
+	"github.com/ipfs/kubo/core/commands/cmdutils"
 	"github.com/ipfs/kubo/core/node"
 	mh "github.com/multiformats/go-multihash"
 
 	dag "github.com/ipfs/boxo/ipld/merkledag"
 	"github.com/ipfs/boxo/ipns"
+	"github.com/ipfs/boxo/provider"
 	cid "github.com/ipfs/go-cid"
 	cmds "github.com/ipfs/go-ipfs-cmds"
 	ipld "github.com/ipfs/go-ipld-format"
@@ -77,7 +79,7 @@ var findProvidersRoutingCmd = &cmds.Command{
 			return errors.New("number of providers must be greater than 0")
 		}
 
-		c, err := cid.Parse(req.Arguments[0])
+		c, err := cmdutils.CidFromArg(req.Arguments[0])
 		if err != nil {
 			return err
 		}
@@ -89,7 +91,7 @@ var findProvidersRoutingCmd = &cmds.Command{
 			defer cancel()
 			pchan := n.Routing.FindProvidersAsync(ctx, c, numProviders)
 			for p := range pchan {
-				np := p
+				np := cmdutils.CloneAddrInfo(p)
 				routing.PublishQueryEvent(ctx, &routing.QueryEvent{
 					Type:      routing.Provider,
 					Responses: []*peer.AddrInfo{&np},
@@ -140,9 +142,27 @@ const (
 )
 
 var provideRefRoutingCmd = &cmds.Command{
-	Status: cmds.Experimental,
+	Status: cmds.Deprecated,
 	Helptext: cmds.HelpText{
-		Tagline: "Announce to the network that you are providing given values.",
+		Tagline: "Deprecated, use 'ipfs provide once' instead.",
+		ShortDescription: `
+'ipfs routing provide' has moved to 'ipfs provide once'. This command keeps
+its existing behavior so existing scripts continue to work, but will be
+removed in a future release.
+
+Compared to 'ipfs provide once', this command:
+
+- Buffers all CIDs from arguments and stdin before doing any work,
+  instead of streaming them as they arrive.
+- Emits no per-CID output: there is no JSON event stream and the -v
+  flag's per-peer events do not actually propagate to the encoder.
+- With -r, re-walks subtrees shared between roots and re-announces
+  shared blocks; 'ipfs provide once' deduplicates across all inputs.
+- Issues an extra synchronous DHT lookup per CID on top of the
+  provider system, which defeats sweep batching.
+
+Prefer 'ipfs provide once' for new scripts and any large input.
+`,
 	},
 
 	Arguments: []cmds.Argument{
@@ -190,7 +210,7 @@ var provideRefRoutingCmd = &cmds.Command{
 
 		var cids []cid.Cid
 		for _, arg := range req.Arguments {
-			c, err := cid.Decode(arg)
+			c, err := cmdutils.CidFromArg(arg)
 			if err != nil {
 				return err
 			}
@@ -267,11 +287,16 @@ var provideRefRoutingCmd = &cmds.Command{
 }
 
 var reprovideRoutingCmd = &cmds.Command{
-	Status: cmds.Experimental,
+	Status: cmds.Deprecated,
 	Helptext: cmds.HelpText{
-		Tagline: "Trigger reprovider.",
+		Tagline: "Trigger a reprovide cycle (legacy provider only).",
 		ShortDescription: `
-Trigger reprovider to announce our data to network.
+Forces the legacy provider to reprovide all locally stored CIDs that match
+Provide.Strategy.
+
+Only works when Provide.DHT.SweepEnabled=false. With the default sweep
+provider, reproviding is continuous and scheduled, so this command returns
+an error. Use 'ipfs provide stat --all' to monitor sweep progress.
 `,
 	},
 	Run: func(req *cmds.Request, res cmds.ResponseEmitter, env cmds.Environment) error {
@@ -284,7 +309,6 @@ Trigger reprovider to announce our data to network.
 			return ErrNotOnline
 		}
 
-		// respect global config
 		cfg, err := nd.Repo.Config()
 		if err != nil {
 			return err
@@ -295,9 +319,11 @@ Trigger reprovider to announce our data to network.
 		if cfg.Provide.DHT.Interval.WithDefault(config.DefaultProvideDHTInterval) == 0 {
 			return errors.New("invalid configuration: Provide.DHT.Interval is set to '0'")
 		}
-		provideSys, ok := nd.Provider.(*node.LegacyProvider)
+		provideSys, ok := nd.Provider.(provider.Reprovider)
 		if !ok {
-			return errors.New("manual reprovide not available with experimental sweeping provider (Provide.DHT.SweepEnabled=true)")
+			err := errors.New("manual reprovide is not available with the sweep provider; set Provide.DHT.SweepEnabled=false to use the legacy provider, or run 'ipfs provide stat --all' to monitor the sweep schedule")
+			log.Error(err)
+			return err
 		}
 
 		err = provideSys.Reprovide(req.Context)

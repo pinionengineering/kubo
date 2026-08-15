@@ -199,9 +199,8 @@ configured, the daemon will fail to start.
 
 ## ipfs p2p
 
-Allows tunneling of TCP connections through Libp2p streams. If you've ever used
-port forwarding with SSH (the `-L` option in OpenSSH), this feature is quite
-similar.
+Allows tunneling of TCP connections through libp2p streams, similar to SSH port
+forwarding (`ssh -L`).
 
 ### State
 
@@ -220,98 +219,20 @@ Experimental, will be stabilized in 0.6.0
 > If you enable this and plan to expose CLI or HTTP RPC to other users or machines,
 > secure RPC API using [`API.Authorizations`](https://github.com/ipfs/kubo/blob/master/docs/config.md#apiauthorizations) or custom auth middleware.
 
-The `p2p` command needs to be enabled in the config:
-
 ```sh
 > ipfs config --json Experimental.Libp2pStreamMounting true
 ```
 
 ### How to use
 
-**Netcat example:**
-
-First, pick a protocol name for your application. Think of the protocol name as
-a port number, just significantly more user-friendly. In this example, we're
-going to use `/x/kickass/1.0`.
-
-***Setup:***
-
-1. A "server" node with peer ID `$SERVER_ID`
-2. A "client" node.
-
-***On the "server" node:***
-
-First, start your application and have it listen for TCP connections on
-port `$APP_PORT`.
-
-Then, configure the p2p listener by running:
-
-```sh
-> ipfs p2p listen /x/kickass/1.0 /ip4/127.0.0.1/tcp/$APP_PORT
-```
-
-This will configure IPFS to forward all incoming `/x/kickass/1.0` streams to
-`127.0.0.1:$APP_PORT` (opening a new connection to `127.0.0.1:$APP_PORT` per
-incoming stream.
-
-***On the "client" node:***
-
-First, configure the client p2p dialer, so that it forwards all inbound
-connections on `127.0.0.1:SOME_PORT` to the server node listening
-on `/x/kickass/1.0`.
-
-```sh
-> ipfs p2p forward /x/kickass/1.0 /ip4/127.0.0.1/tcp/$SOME_PORT /p2p/$SERVER_ID
-```
-
-Next, have your application open a connection to `127.0.0.1:$SOME_PORT`. This
-connection will be forwarded to the service running on `127.0.0.1:$APP_PORT` on
-the remote machine. You can test it with netcat:
-
-***On "server" node:***
-```sh
-> nc -v -l -p $APP_PORT
-```
-
-***On "client" node:***
-```sh
-> nc -v 127.0.0.1 $SOME_PORT
-```
-
-You should now see that a connection has been established and be able to
-exchange messages between netcat instances.
-
-(note that depending on your netcat version you may need to drop the `-v` flag)
-
-**SSH example**
-
-**Setup:**
-
-1. A "server" node with peer ID `$SERVER_ID` and running ssh server on the
-   default port.
-2. A "client" node.
-
-_you can get `$SERVER_ID` by running `ipfs id -f "<id>\n"`_
-
-***First, on the "server" node:***
-
-```sh
-ipfs p2p listen /x/ssh /ip4/127.0.0.1/tcp/22
-```
-
-***Then, on "client" node:***
-
-```sh
-ipfs p2p forward /x/ssh /ip4/127.0.0.1/tcp/2222 /p2p/$SERVER_ID
-```
-
-You should now be able to connect to your ssh server through a libp2p connection
-with `ssh [user]@127.0.0.1 -p 2222`.
-
+See [docs/p2p-tunnels.md](p2p-tunnels.md) for usage examples, foreground mode,
+and systemd integration.
 
 ### Road to being a real feature
 
-- [ ] More documentation
+- [x] More documentation
+- [x] `ipfs p2p forward` mode
+- [ ] Ability to define tunnels via JSON config, similar to [`Peering.Peers`](https://github.com/ipfs/kubo/blob/master/docs/config.md#peeringpeers), see [kubo#5460](https://github.com/ipfs/kubo/issues/5460)
 
 ## p2p http proxy
 
@@ -405,11 +326,11 @@ We also support the use of protocol names of the form /x/$NAME/http where $NAME 
 ## FUSE
 
 FUSE makes it possible to mount `/ipfs`, `/ipns` and `/mfs` namespaces in your OS,
-allowing arbitrary apps access to IPFS using a subset of filesystem abstractions.
+allowing arbitrary apps access to IPFS using standard filesystem operations.
 
-It is considered  EXPERIMENTAL due to limited (and buggy) support on some platforms.
+It is considered EXPERIMENTAL due to limited support on some platforms.
 
-See [fuse.md](./fuse.md) for more details.
+See [fuse.md](./fuse.md) for setup instructions and details.
 
 ## Plugins
 
@@ -454,6 +375,8 @@ kubo now automatically shards when directory block is bigger than 256KB, ensurin
 
 ## IPNS pubsub
 
+Specification: [IPNS PubSub Router](https://specs.ipfs.tech/ipns/ipns-pubsub-router/)
+
 ### In Version
 
 0.4.14 :
@@ -468,13 +391,18 @@ kubo now automatically shards when directory block is bigger than 256KB, ensurin
 0.11.0 :
   - Can be enabled via `Ipns.UsePubsub` flag in config
 
+0.40.0 :
+  - Persistent message sequence number validation to prevent message cycles
+    in large networks
+
 ### State
 
 Experimental, default-disabled.
 
-Utilizes pubsub for publishing ipns records in real time.
+Utilizes pubsub for publishing IPNS records in real time.
 
 When it is enabled:
+
 - IPNS publishers push records to a name-specific pubsub topic,
   in addition to publishing to the DHT.
 - IPNS resolvers subscribe to the name-specific topic on first
@@ -482,9 +410,6 @@ When it is enabled:
   This makes subsequent resolutions instant, as they are resolved through the local cache.
 
 Both the publisher and the resolver nodes need to have the feature enabled for it to work effectively.
-
-Note: While IPNS pubsub has been available since 0.4.14, it received major changes in 0.5.0.
-Users interested in this feature should upgrade to at least 0.5.0
 
 ### How to enable
 
@@ -495,13 +420,12 @@ ipfs config --json Ipns.UsePubsub true
 ```
 
 NOTE:
-- This feature implicitly enables [ipfs pubsub](#ipfs-pubsub).
+- This feature implicitly enables pubsub.
 - Passing `--enable-namesys-pubsub` CLI flag overrides `Ipns.UsePubsub` config.
 
 ### Road to being a real feature
 
 - [ ] Needs more people to use and report on how well it works
-- [ ] Pubsub enabled as a real feature
 
 ## AutoRelay
 
@@ -567,7 +491,11 @@ Stable, enabled by default
 
 ### State
 
-Experimental, disabled by default.
+Enabled by default since Kubo 0.39.
+
+The sweep provider has been the default since Kubo 0.39, and it turns optimistic provide on for you. So most nodes already use it. Optimistic provide speeds up the immediate announcement of a root CID when you run `ipfs add`. Scheduled reprovides do not use it; they go through the sweep provider.
+
+You only need the `Experimental.OptimisticProvide` flag if you run the legacy provider ([`Provide.DHT.SweepEnabled=false`](https://github.com/ipfs/kubo/blob/master/docs/config.md#providedhtsweepenabled)). Set it to `true` there to turn optimistic provide on.
 
 When the Amino DHT client tries to store a provider in the DHT, it typically searches for the 20 peers that are closest to the
 target key. However, this process can be time-consuming, as the search terminates only after no closer peers are found
@@ -583,7 +511,7 @@ ones. This heuristic approach can significantly speed up the process, resulting 
 When it is enabled:
 
 - Amino DHT provide operations should complete much faster than with it disabled
-- This can be tested with commands such as `ipfs routing provide`
+- This can be tested with commands such as `ipfs provide once`
 
 **Tradeoffs**
 
@@ -611,17 +539,21 @@ than the classic client.
 
 For more information, see:
 
+- ProbeLab measurements and explainer: https://probelab.io/blog/optimistic-provide/
 - Project doc: https://protocollabs.notion.site/Optimistic-Provide-2c79745820fa45649d48de038516b814
 - go-libp2p-kad-dht: https://github.com/libp2p/go-libp2p-kad-dht/pull/783
 
 ### Configuring
-To enable:
+
+With the default sweep provider, optimistic provide is already enabled and there is nothing to configure. The settings below only matter when running the legacy provider (`Provide.DHT.SweepEnabled=false`).
+
+To enable optimistic provide for the legacy provider:
 
 ```
 ipfs config --json Experimental.OptimisticProvide true
 ```
 
-If you want to change the `OptimisticProvideJobsPoolSize` setting from its default of 60:
+To change the `OptimisticProvideJobsPoolSize` setting from its default of 60:
 
 ```
 ipfs config --json Experimental.OptimisticProvideJobsPoolSize 120
@@ -675,7 +607,7 @@ ipfs config --json Experimental.GatewayOverLibp2p true
 - [ ] Needs more people to use and report on how well it works
 - [ ] Needs UX work for exposing non-recursive "HTTP transport" (NoFetch) over both libp2p and plain TCP (and sharing the configuration)
 - [ ] Needs a mechanism for HTTP handler to signal supported features ([IPIP-425](https://github.com/ipfs/specs/pull/425))
-- [ ] Needs an option for Kubo to detect peers that have it enabled and prefer HTTP transport before falling back to bitswap (and use CAR if peer supports dag-scope=entity from [IPIP-402](https://github.com/ipfs/specs/pull/402))
+- [ ] Needs an option for Kubo to detect peers that have it enabled and prefer HTTP transport before falling back to bitswap (and use CAR if peer supports dag-scope=entity from [IPIP-402](https://specs.ipfs.tech/ipips/ipip-0402/))
 
 ## Accelerated DHT Client
 

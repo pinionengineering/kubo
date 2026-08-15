@@ -28,6 +28,9 @@ func setupTestNode(t *testing.T) *harness.Node {
 	t.Helper()
 	node := harness.NewT(t).NewNode().Init()
 	node.StartDaemon("--offline")
+	t.Cleanup(func() {
+		node.StopDaemon()
+	})
 	return node
 }
 
@@ -131,8 +134,8 @@ func TestPinLsWithNamesForSpecificCIDs(t *testing.T) {
 		assertCIDOnly(t, output, cidC)
 
 		// Pin C should appear but without a name (just type)
-		lines := strings.Split(output, "\n")
-		for _, line := range lines {
+		lines := strings.SplitSeq(output, "\n")
+		for line := range lines {
 			if strings.Contains(line, cidC) {
 				// Should have CID and type but no name
 				require.Contains(t, line, "recursive", "pin type 'recursive' not found for unnamed pin %s in line: %s", cidC, line)
@@ -359,7 +362,7 @@ func TestPinLsWithNamesForSpecificCIDs(t *testing.T) {
 		numPins := 10
 		done := make(chan struct{}, numPins)
 
-		for i := 0; i < numPins; i++ {
+		for i := range numPins {
 			go func(idx int) {
 				defer func() { done <- struct{}{} }()
 
@@ -371,14 +374,14 @@ func TestPinLsWithNamesForSpecificCIDs(t *testing.T) {
 		}
 
 		// Wait for all goroutines
-		for i := 0; i < numPins; i++ {
+		for range numPins {
 			<-done
 		}
 
 		// Verify all pins have correct names
 		res := node.IPFS("pin", "ls", "--names")
 		output := res.Stdout.String()
-		for i := 0; i < numPins; i++ {
+		for i := range numPins {
 			pinName := fmt.Sprintf("concurrent-pin-%d", i)
 			require.Contains(t, output, pinName,
 				"concurrent pin name '%s' not found in output", pinName)
@@ -498,7 +501,6 @@ func TestPinLsEdgeCases(t *testing.T) {
 	t.Run("invalid pin type returns error", func(t *testing.T) {
 		t.Parallel()
 		node := setupTestNode(t)
-		defer node.StopDaemon()
 
 		// Try to list pins with invalid type
 		res := node.RunIPFS("pin", "ls", "--type=invalid")
@@ -507,10 +509,20 @@ func TestPinLsEdgeCases(t *testing.T) {
 		require.Contains(t, res.Stderr.String(), "must be one of {direct, indirect, recursive, all}")
 	})
 
+	t.Run("known but non-listable pin type returns error", func(t *testing.T) {
+		t.Parallel()
+		node := setupTestNode(t)
+
+		// "internal" is a valid pin.Mode in boxo but not a valid --type for pin ls.
+		// Before the fix, this caused a panic instead of returning an error.
+		res := node.RunIPFS("pin", "ls", "--type=internal")
+		require.NotEqual(t, 0, res.ExitCode())
+		require.Contains(t, res.Stderr.String(), "invalid type 'internal'")
+	})
+
 	t.Run("non-existent path returns proper error", func(t *testing.T) {
 		t.Parallel()
 		node := setupTestNode(t)
-		defer node.StopDaemon()
 
 		// Try to list a non-existent CID
 		fakeCID := "QmNonExistent123456789"
@@ -521,7 +533,6 @@ func TestPinLsEdgeCases(t *testing.T) {
 	t.Run("unpinned CID returns not pinned error", func(t *testing.T) {
 		t.Parallel()
 		node := setupTestNode(t)
-		defer node.StopDaemon()
 
 		// Add content but don't pin it explicitly (it's just in blockstore)
 		unpinnedCID := node.IPFSAddStr("unpinned content", "--pin=false")
