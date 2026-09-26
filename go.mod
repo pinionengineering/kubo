@@ -342,7 +342,7 @@ require (
 	github.com/pinionengineering/datastores v0.0.0-20251205024421-9206ed7cae4a // indirect
 	github.com/pinionengineering/go-ds-blob v0.0.0-20240910094632-f3ffb79047f0 // indirect
 	github.com/pinionengineering/pinning-service-models v0.0.0-20260610232406-87c128cc1789 // indirect
-	github.com/pinionengineering/pinning-service-models-internal v0.0.0-20260815055231-8bc63ca0254f // indirect
+	github.com/pinionengineering/pinning-service-models-internal v0.0.0-20260926044628-f372ab12106c // indirect
 	github.com/pinionengineering/reconciler v0.0.0-20260815054841-de83e7946a47 // indirect
 	github.com/pkg/browser v0.0.0-20240102092130-5ac0b6a4141c // indirect
 	github.com/planetscale/vtprotobuf v0.6.1-0.20240319094008-0393e58bdf10 // indirect

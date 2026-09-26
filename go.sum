@@ -821,6 +821,8 @@ github.com/pinionengineering/pinning-service-models-internal v0.0.0-202508050705
 github.com/pinionengineering/pinning-service-models-internal v0.0.0-20250805070521-56fc234dabde/go.mod h1:VouY7+Msu8aV2crhhPIsfSy5xcpks69ixstFPuGSUek=
 github.com/pinionengineering/pinning-service-models-internal v0.0.0-20260815055231-8bc63ca0254f h1:kO99edEfY2Fy57ZkcAmd0vnCjf7CuuI0+QFgsbtcFkU=
 github.com/pinionengineering/pinning-service-models-internal v0.0.0-20260815055231-8bc63ca0254f/go.mod h1:C293LZwF6gWrEbgeWYXgVKg+p5gs4Qk/KB03xnKn/78=
+github.com/pinionengineering/pinning-service-models-internal v0.0.0-20260926044628-f372ab12106c h1:mAN+BXAdjUf0ltP0ozr9LcLZKL1m3nvFRD2GlpWINRg=
+github.com/pinionengineering/pinning-service-models-internal v0.0.0-20260926044628-f372ab12106c/go.mod h1:C293LZwF6gWrEbgeWYXgVKg+p5gs4Qk/KB03xnKn/78=
 github.com/pinionengineering/reconciler v0.0.0-20260815054841-de83e7946a47 h1:+20uhCIhoTEO+QQR2wLqbE7LbC2lygtLhFwrtdU5HO8=
 github.com/pinionengineering/reconciler v0.0.0-20260815054841-de83e7946a47/go.mod h1:OVtSyMBITGsBfOV2alKRBAJY5FU7nogYGtUQWa1j8uQ=
 github.com/pion/datachannel v1.5.10 h1:ly0Q26K1i6ZkGf42W7D4hQYR90pZwzFOjTq5AuCKk4o=
